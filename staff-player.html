@@ -320,8 +320,9 @@ function onStart(id, x, y) {
     : Math.max(-12, Math.min(rawSp, 4));
   const midi = staffPosToMidi(sp, 0);
   const sound = new NoteSound(midiToFreq(midi));
+  const wasAudible = audioCtx && audioCtx.state === 'running';
   const side = x > W / 2 ? 'left' : 'right';
-  activeTouches.set(id, { staffPos: sp, alteration: 0, x, y, startY: y, sound, side, midi, clef });
+  activeTouches.set(id, { staffPos: sp, alteration: 0, x, y, startY: y, sound, side, midi, clef, wasAudible });
   draw();
 }
 
@@ -344,7 +345,26 @@ function onMove(id, x, y) {
 
 function onEnd(id) {
   const t = activeTouches.get(id);
-  if (t) { t.sound.release(); activeTouches.delete(id); draw(); }
+  if (!t) return;
+  // If the note was started before audio was unlocked, play a short blip now
+  if (!t.wasAudible && audioCtx && audioCtx.state === 'running') {
+    const freq = midiToFreq(t.midi);
+    const now = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    g.gain.setValueAtTime(0.3, now);
+    g.gain.linearRampToValueAtTime(0, now + 0.25);
+    osc.connect(g);
+    g.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.3);
+    dbg('Blip on release: f=' + Math.round(freq));
+  }
+  t.sound.release();
+  activeTouches.delete(id);
+  draw();
 }
 
 // Touch events
@@ -358,6 +378,7 @@ canvas.addEventListener('touchmove', e => {
 }, {passive:false});
 canvas.addEventListener('touchend', e => {
   e.preventDefault();
+  ensureAudio(); // iOS: touchend counts as user activation even after long press
   for (const t of e.changedTouches) onEnd(t.identifier);
 }, {passive:false});
 canvas.addEventListener('touchcancel', e => {
