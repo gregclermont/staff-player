@@ -77,9 +77,19 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 // ═══════════════════════════════════════════════════════════
 
 let audioCtx = null;
+let audioUnlocked = false;
 function ensureAudio() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === 'suspended') audioCtx.resume();
+  // iOS Safari requires playing a buffer during a user gesture to unlock audio
+  if (!audioUnlocked) {
+    const buf = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.start();
+    audioUnlocked = true;
+  }
 }
 
 class NoteSound {
