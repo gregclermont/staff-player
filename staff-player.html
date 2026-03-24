@@ -12,15 +12,16 @@ html,body{height:100%;overflow:hidden;touch-action:none;background:#fff;color:#1
 user-select:none;-webkit-user-select:none;font-family:-apple-system,system-ui,sans-serif}
 body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
 
-.key-bar{display:flex;align-items:center;justify-content:center;gap:3px;padding:10px 8px 8px;flex-shrink:0;flex-wrap:wrap}
+.key-bar{display:flex;align-items:stretch;margin:0;flex-shrink:0;
+border-bottom:1px solid #ccc;border-top:1px solid #ccc;background:#f5f5f5}
 .key-btn{
-  border:1px solid #ddd;background:#f0f0f0;color:#1a1a1a;
-  font-size:13px;font-weight:600;padding:5px 8px;border-radius:6px;
-  min-width:32px;text-align:center;cursor:pointer;transition:all 0.15s;
-  font-family:inherit;line-height:1.2;
+  flex:1;border:none;border-right:1px solid #ccc;background:transparent;color:#1a1a1a;
+  font-size:15px;padding:6px 0;text-align:center;cursor:pointer;transition:all 0.15s;
+  font-family:inherit;line-height:1;
 }
-.key-btn.active{background:#d4621a;color:#fff;border-color:#d4621a}
-.key-btn:active{transform:scale(0.94)}
+.key-btn:last-child{border-right:none}
+.key-btn.active{background:#d74002;color:#fff}
+.key-btn:active{background:#e8e8e8}
 
 canvas{flex:1;width:100%;display:block}
 </style>
@@ -132,9 +133,10 @@ let LINE_SP;      // distance between adjacent staff lines
 let TREBLE_TOP;   // y of top line of treble staff
 let BASS_TOP;     // y of top line of bass staff
 let BASS_SHIFT;   // extra Y offset for bass staff (gap between systems)
-let STAFF_LEFT = 12;
+let STAFF_LEFT = 0;
 let STAFF_RIGHT;
 let CLEF_W;
+let staffLW;
 
 // Key sig accidental positions on staff
 // Treble sharp pos (staffPos): F5=10, C5=7, G5=11, D5=8, A4=5, E5=9, B4=6
@@ -170,7 +172,7 @@ function resize() {
   canvas.width = W * dpr; canvas.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  LINE_SP = Math.min(14, Math.max(10, H / 32));
+  LINE_SP = Math.min(28, Math.max(20, H / 16));
 
   // Layout: treble(4) + gap(6 = 5 lines + borders) + bass(4) = 14 LINE_SPs
   // Gap has: 2 grey ledger below treble, 1 invisible, 2 grey ledger above bass
@@ -181,7 +183,7 @@ function resize() {
   BASS_SHIFT = 4 * LINE_SP; // extra offset pushing bass down from its natural position
   BASS_TOP = top + 10 * LINE_SP;
 
-  STAFF_RIGHT = W - 12;
+  STAFF_RIGHT = W;
   CLEF_W = LINE_SP * 4;
 }
 
@@ -267,8 +269,8 @@ function drawKeySigOnStaff(clef) {
   for (let i = 0; i < count; i++) {
     const x = STAFF_LEFT + CLEF_W + i * LINE_SP;
     const y = staffPosToY(positions[i], clef);
-    if (keySig > 0) drawSharpSym(x, y, sz, '#1a1a1a');
-    else drawFlatSym(x, y, sz, '#1a1a1a');
+    if (keySig > 0) drawSharpSym(x, y, sz, '#ddd');
+    else drawFlatSym(x, y, sz, '#ddd');
   }
 }
 
@@ -301,7 +303,7 @@ function onMove(id, x, y) {
   const t = activeTouches.get(id);
   if (!t) return;
   const dy = t.startY - y; // positive = dragged up
-  const threshold = LINE_SP * 1.5;
+  const threshold = LINE_SP * 1;
   let newAlt = 0;
   if (dy > threshold) newAlt = 1;
   else if (dy < -threshold) newAlt = -1;
@@ -358,8 +360,15 @@ function draw() {
 
   // ── Staff lines ──
   // Treble: lines at sp = 2, 4, 6, 8, 10 (E4 G4 B4 D5 F5)
+  staffLW = Math.max(1.2, LINE_SP * 0.08);
+
+  // ── Key signature (behind lines, grey) ──
+  drawKeySigOnStaff('treble');
+  drawKeySigOnStaff('bass');
+
+  // ── Staff lines ──
   ctx.strokeStyle = '#1a1a1a';
-  ctx.lineWidth = 1.2;
+  ctx.lineWidth = staffLW;
   for (let i = 0; i < 5; i++) {
     const y = TREBLE_TOP + i * LINE_SP;
     ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
@@ -375,7 +384,7 @@ function draw() {
   // 2 below treble: C4 (sp=0), A3 (sp=-2)
   // 2 above bass: C4 (sp=0), E4 (sp=2)
   ctx.strokeStyle = '#bbb';
-  ctx.lineWidth = 0.9;
+  ctx.lineWidth = staffLW;
   const greyLW = LINE_SP * 2.5;
   const gcx = W / 2;
   for (const sp of [0, -2]) {
@@ -393,10 +402,6 @@ function draw() {
   renderOutline(GCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, TREBLE_TOP + 3 * LINE_SP);
   renderOutline(FCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, BASS_TOP + LINE_SP);
 
-  // ── Key signature ──
-  drawKeySigOnStaff('treble');
-  drawKeySigOnStaff('bass');
-
   // ── Active notes ──
   for (const [, t] of activeTouches) drawNote(t);
 }
@@ -405,14 +410,13 @@ function drawNote(t) {
   const sp = t.staffPos;
   const clef = t.clef;
   const noteY = staffPosToY(sp, clef);
-  const offsetDist = LINE_SP * 3.5;
-  const noteX = t.side === 'left' ? t.x - offsetDist : t.x + offsetDist;
+  const noteX = W / 2;
 
-  const accent = '#d4621a';
+  const accent = '#d74002';
 
   // ── Ledger lines for this note ──
   ctx.strokeStyle = '#1a1a1a';
-  ctx.lineWidth = 1.1;
+  ctx.lineWidth = staffLW;
   const lw = LINE_SP * 1.2;
 
   if (clef === 'treble') {
@@ -457,20 +461,6 @@ function drawNote(t) {
   ctx.fill();
   ctx.restore();
 
-  // ── Stem ──
-  const stemUp = clef === 'treble' ? sp < 6 : sp < -6;
-  ctx.strokeStyle = accent;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  if (stemUp) {
-    ctx.moveTo(noteX + LINE_SP * 0.62, noteY - LINE_SP * 0.1);
-    ctx.lineTo(noteX + LINE_SP * 0.62, noteY - LINE_SP * 3.2);
-  } else {
-    ctx.moveTo(noteX - LINE_SP * 0.62, noteY + LINE_SP * 0.1);
-    ctx.lineTo(noteX - LINE_SP * 0.62, noteY + LINE_SP * 3.2);
-  }
-  ctx.stroke();
-
   // ── Accidental (sharp/flat/natural) ──
   if (t.alteration !== 0) {
     const accX = noteX - LINE_SP * 1.4;
@@ -505,7 +495,7 @@ const keyBar = document.getElementById('keyBar');
 KEY_SIGS.forEach(ks => {
   const btn = document.createElement('button');
   btn.className = 'key-btn' + (ks.v === 0 ? ' active' : '');
-  btn.textContent = ks.l;
+  btn.textContent = ks.v < 0 ? '♭' : ks.v > 0 ? '♯' : '♮';
   btn.addEventListener('click', () => {
     keySig = ks.v;
     document.querySelectorAll('.key-btn').forEach(b => b.classList.remove('active'));
