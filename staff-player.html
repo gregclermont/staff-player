@@ -95,27 +95,34 @@ function ensureAudio() {
 class NoteSound {
   constructor(freq) {
     ensureAudio();
+    const now = audioCtx.currentTime;
     this.osc = audioCtx.createOscillator();
     this.gain = audioCtx.createGain();
     this.osc.type = 'sine';
     this.osc.frequency.value = freq;
-    this.gain.gain.value = 0;
+    // iOS Safari needs explicit scheduling from a known value
+    this.gain.gain.setValueAtTime(0.001, now);
+    this.gain.gain.linearRampToValueAtTime(0.32, now + 0.03);
     this.osc.connect(this.gain);
     this.gain.connect(audioCtx.destination);
-    this.osc.start();
-    // Quick attack to avoid click
-    this.gain.gain.setTargetAtTime(0.28, audioCtx.currentTime, 0.01);
+    this.osc.start(now);
     this.alive = true;
   }
   setFreq(f) {
-    if (this.alive) this.osc.frequency.setTargetAtTime(f, audioCtx.currentTime, 0.015);
+    if (this.alive) {
+      const now = audioCtx.currentTime;
+      this.osc.frequency.setValueAtTime(this.osc.frequency.value, now);
+      this.osc.frequency.linearRampToValueAtTime(f, now + 0.02);
+    }
   }
   release() {
     if (!this.alive) return;
     this.alive = false;
     const now = audioCtx.currentTime;
-    this.gain.gain.setTargetAtTime(0, now, 0.06);
-    setTimeout(() => { try { this.osc.stop(); } catch(e){} }, 400);
+    this.gain.gain.cancelScheduledValues(now);
+    this.gain.gain.setValueAtTime(this.gain.gain.value, now);
+    this.gain.gain.linearRampToValueAtTime(0, now + 0.15);
+    this.osc.stop(now + 0.2);
   }
 }
 
