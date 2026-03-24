@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>Staff Player</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;touch-action:none;background:#fff;color:#1a1a1a;
+user-select:none;-webkit-user-select:none;font-family:-apple-system,system-ui,sans-serif}
+body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+
+.key-bar{display:flex;align-items:center;justify-content:center;gap:3px;padding:10px 8px 8px;flex-shrink:0;flex-wrap:wrap}
+.key-btn{
+  border:1px solid #ddd;background:#f0f0f0;color:#1a1a1a;
+  font-size:13px;font-weight:600;padding:5px 8px;border-radius:6px;
+  min-width:32px;text-align:center;cursor:pointer;transition:all 0.15s;
+  font-family:inherit;line-height:1.2;
+}
+.key-btn.active{background:#d4621a;color:#fff;border-color:#d4621a}
+.key-btn:active{transform:scale(0.94)}
+
+canvas{flex:1;width:100%;display:block}
+</style>
+</head>
+<body>
+
+<div class="key-bar" id="keyBar"></div>
+<canvas id="c"></canvas>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+// MUSIC THEORY
+// ═══════════════════════════════════════════════════════════
+
+// Staff positions: 0 = middle C (C4).
+// +1 = D4, +2 = E4, ... +7 = C5.  -1 = B3, -2 = A3, etc.
+// Lines are at even positions in each staff region.
+// Treble staff lines (bottom to top): E4=2, G4=4, B4=6, D5=8, F5=10
+// Bass staff lines (top to bottom): A3=-2, F3=-4, D3=-6, B2=-8, G2=-10
+
+const SHARP_ORDER = [3, 0, 4, 1, 5, 2, 6]; // scale degrees: F C G D A E B
+const FLAT_ORDER  = [6, 2, 5, 1, 4, 0, 3]; // B E A D G C F
+
+const DIATONIC_SEMI = [0, 2, 4, 5, 7, 9, 11]; // C D E F G A B
+
+const KEY_SIGS = [
+  {l:'7♭',v:-7},{l:'6♭',v:-6},{l:'5♭',v:-5},{l:'4♭',v:-4},
+  {l:'3♭',v:-3},{l:'2♭',v:-2},{l:'1♭',v:-1},{l:'—',v:0},
+  {l:'1♯',v:1},{l:'2♯',v:2},{l:'3♯',v:3},{l:'4♯',v:4},
+  {l:'5♯',v:5},{l:'6♯',v:6},{l:'7♯',v:7},
+];
+
+let keySig = 0;
+
+function getAlteredDegrees(ks) {
+  const m = new Map();
+  if (ks > 0) for (let i = 0; i < ks; i++) m.set(SHARP_ORDER[i], 1);
+  else if (ks < 0) for (let i = 0; i < -ks; i++) m.set(FLAT_ORDER[i], -1);
+  return m;
+}
+
+function staffPosToMidi(sp, alteration) {
+  const deg = ((sp % 7) + 7) % 7;
+  const oct = 4 + Math.floor(sp / 7);
+  const alt = getAlteredDegrees(keySig);
+  const ksAdj = alt.has(deg) ? alt.get(deg) : 0;
+  return 60 + (oct - 4) * 12 + DIATONIC_SEMI[deg] + ksAdj + alteration;
+}
+
+function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+
+// ═══════════════════════════════════════════════════════════
+// AUDIO
+// ═══════════════════════════════════════════════════════════
+
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+class NoteSound {
+  constructor(freq) {
+    ensureAudio();
+    this.osc = audioCtx.createOscillator();
+    this.gain = audioCtx.createGain();
+    this.osc.type = 'sine';
+    this.osc.frequency.value = freq;
+    this.gain.gain.value = 0;
+    this.osc.connect(this.gain);
+    this.gain.connect(audioCtx.destination);
+    this.osc.start();
+    // Quick attack to avoid click
+    this.gain.gain.setTargetAtTime(0.28, audioCtx.currentTime, 0.01);
+    this.alive = true;
+  }
+  setFreq(f) {
+    if (this.alive) this.osc.frequency.setTargetAtTime(f, audioCtx.currentTime, 0.015);
+  }
+  release() {
+    if (!this.alive) return;
+    this.alive = false;
+    const now = audioCtx.currentTime;
+    this.gain.gain.setTargetAtTime(0, now, 0.06);
+    setTimeout(() => { try { this.osc.stop(); } catch(e){} }, 400);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// LAYOUT
+// ═══════════════════════════════════════════════════════════
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, dpr;
+let LINE_SP;      // distance between adjacent staff lines
+let TREBLE_TOP;   // y of top line of treble staff
+let BASS_TOP;     // y of top line of bass staff
+let BASS_SHIFT;   // extra Y offset for bass staff (gap between systems)
+let STAFF_LEFT = 12;
+let STAFF_RIGHT;
+let CLEF_W;
+
+// Key sig accidental positions on staff
+// Treble sharp pos (staffPos): F5=10, C5=7, G5=11, D5=8, A4=5, E5=9, B4=6
+const T_SHARP = [10, 7, 11, 8, 5, 9, 6];
+const T_FLAT  = [6, 9, 5, 8, 4, 7, 3];
+// Bass: same visual positions as treble, mapped to bass staff positions
+const B_SHARP = [-4, -7, -3, -6, -9, -5, -8];
+const B_FLAT  = [-8, -5, -9, -6, -10, -7, -11];
+
+function staffPosToY(sp, clef) {
+  // Treble system: sp=2 (E4) at TREBLE_TOP + 4*LINE_SP
+  const trebleBottom = TREBLE_TOP + 4 * LINE_SP;
+  const y = trebleBottom - (sp - 2) * (LINE_SP / 2);
+  return clef === 'bass' ? y + BASS_SHIFT : y;
+}
+
+function yToStaffInfo(y) {
+  // Determine which clef system a Y coordinate belongs to
+  const mid = (TREBLE_TOP + 4 * LINE_SP + BASS_TOP) / 2;
+  if (y <= mid) {
+    const sp = Math.round(2 + (TREBLE_TOP + 4 * LINE_SP - y) / (LINE_SP / 2));
+    return { sp, clef: 'treble' };
+  } else {
+    const sp = Math.round(-2 - (y - BASS_TOP) / (LINE_SP / 2));
+    return { sp, clef: 'bass' };
+  }
+}
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  LINE_SP = Math.min(14, Math.max(10, H / 32));
+
+  // Layout: treble(4) + gap(6 = 5 lines + borders) + bass(4) = 14 LINE_SPs
+  // Gap has: 2 grey ledger below treble, 1 invisible, 2 grey ledger above bass
+  const total = 14 * LINE_SP;
+  const top = (H - total) / 2;
+
+  TREBLE_TOP = top;
+  BASS_SHIFT = 4 * LINE_SP; // extra offset pushing bass down from its natural position
+  BASS_TOP = top + 10 * LINE_SP;
+
+  STAFF_RIGHT = W - 12;
+  CLEF_W = LINE_SP * 4;
+}
+
+// ═══════════════════════════════════════════════════════════
+// DRAWING HELPERS
+// ═══════════════════════════════════════════════════════════
+
+// Bravura accidental outlines (SIL Open Font License 1.1)
+const ACC_SHARP_O = 'm 341 170 b 359 194 351 174 359 186 l 359 297 b 348 308 359 304 354 308 b 341 307 346 308 344 308 b 305 294 341 307 312 295 b 285 312 295 294 285 301 l 285 488 b 265 504 285 497 276 504 b 242 488 251 504 242 497 l 242 301 b 223 259 240 287 236 268 b 132 223 206 249 157 229 b 115 252 120 223 115 240 l 115 425 b 95 441 115 433 105 441 b 72 425 81 441 72 433 l 72 230 b 55 192 72 210 63 196 b 17 176 46 187 17 176 b 0 153 7 173 0 161 l 0 50 b 13 37 0 42 4 37 l 16 39 b 50 53 17 39 39 48 l 52 55 b 72 29 63 55 72 40 l 72 -114 b 56 -147 72 -130 65 -143 b 17 -163 48 -150 17 -163 b 0 -186 7 -166 0 -177 l 0 -288 b 13 -301 0 -297 4 -301 l 16 -300 b 50 -287 17 -300 37 -291 b 55 -285 52 -285 53 -285 b 72 -308 65 -285 72 -301 l 72 -485 b 91 -501 72 -494 81 -501 b 115 -485 105 -501 115 -494 l 115 -285 b 130 -253 115 -266 122 -256 l 217 -217 b 219 -217 217 -217 219 -217 l 222 -216 b 242 -242 235 -216 242 -233 l 242 -422 b 261 -438 242 -431 251 -438 b 285 -422 276 -438 285 -431 l 285 -217 b 301 -184 285 -206 291 -189 b 341 -168 311 -180 341 -168 b 359 -144 351 -164 359 -153 l 359 -42 b 348 -30 359 -35 354 -30 b 341 -32 346 -30 344 -30 l 304 -46 b 285 -20 295 -46 285 -37 l 285 114 b 304 156 285 124 292 151 z m 242 -65 b 132 -122 233 -94 166 -122 b 115 -115 124 -122 117 -120 b 111 -43 112 -109 111 -78 b 115 63 111 1 112 52 b 220 118 118 88 184 118 b 242 109 230 118 239 115 b 248 27 245 102 248 66 b 242 -65 248 -12 245 -52 z';
+const ACC_FLAT_O = 'm 17 -245 b 30 -252 22 -251 26 -252 b 39 -249 35 -252 39 -249 b 153 -161 82 -225 117 -186 b 325 82 281 -72 325 16 b 196 220 325 164 262 216 b 117 196 171 220 137 209 b 85 176 108 189 92 176 b 78 177 82 176 81 176 b 62 202 68 181 62 192 b 72 608 63 233 72 579 b 45 632 72 624 59 632 b 0 592 24 632 1 618 b 17 -245 0 592 6 -230 z m 68 -117 b 63 27 68 -117 63 -30 b 66 73 63 50 65 68 b 167 144 76 102 134 144 b 226 60 209 144 226 96 b 98 -134 226 -17 160 -95 b 84 -138 92 -137 88 -138 b 68 -117 71 -138 68 -124 z';
+const ACC_NATURAL_O = 'm 203 261 b 197 259 200 261 199 259 b 68 226 197 259 105 226 b 53 233 59 226 53 228 l 53 474 b 36 491 53 484 45 491 l 17 491 b 0 474 7 491 0 484 l 0 -268 b 13 -281 0 -276 4 -281 l 16 -279 b 22 -278 17 -279 20 -279 b 164 -235 42 -269 122 -235 b 189 -251 179 -235 189 -239 l 189 -465 b 206 -482 189 -475 196 -482 l 225 -482 b 242 -465 233 -482 242 -475 l 242 258 b 230 269 242 265 236 269 b 225 268 229 269 226 269 z m 53 56 b 176 114 53 76 141 114 b 189 107 184 114 189 112 l 189 -42 b 71 -101 189 -68 107 -101 b 53 -92 60 -101 53 -98 z';
+
+// Accidental metrics (for centering): sharp w=359 h=698, flat w=325 h=614, natural w=242 h=676
+function drawSharpSym(cx, cy, sz, color) {
+  const scale = sz / 350;
+  ctx.fillStyle = color;
+  renderOutline(ACC_SHARP_O, scale, cx - 180 * scale, cy);
+}
+function drawFlatSym(cx, cy, sz, color) {
+  const scale = sz / 310;
+  ctx.fillStyle = color;
+  renderOutline(ACC_FLAT_O, scale, cx - 80 * scale, cy);
+}
+function drawNaturalSym(cx, cy, sz, color) {
+  const scale = sz / 340;
+  ctx.fillStyle = color;
+  renderOutline(ACC_NATURAL_O, scale, cx - 120 * scale, cy);
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLEFS — Bravura font glyphs (SIL Open Font License 1.1)
+// Source: Steinberg Bravura via VexFlow
+// Rendered using VexFlow's outline format (absolute coords)
+// ═══════════════════════════════════════════════════════════
+
+const GCLEF_O = 'm 541 598 b 550 625 539 615 541 616 b 824 1174 706 770 824 953 b 730 1509 824 1299 789 1423 b 655 1581 708 1541 671 1581 b 562 1512 635 1581 590 1544 b 420 1064 455 1394 420 1214 b 441 828 420 981 431 887 b 428 793 444 811 445 808 b 0 125 220 622 0 416 b 524 -363 0 -125 171 -363 b 624 -354 557 -363 595 -360 b 645 -367 639 -351 642 -350 b 684 -657 662 -464 684 -589 b 455 -896 684 -870 540 -896 b 340 -854 377 -896 340 -873 b 386 -829 340 -844 353 -840 b 482 -694 431 -816 482 -778 b 344 -547 482 -615 432 -547 b 190 -713 248 -547 190 -624 b 464 -948 190 -806 246 -948 b 747 -660 560 -948 747 -904 b 706 -351 747 -577 721 -441 b 724 -327 703 -334 704 -336 b 966 16 870 -269 966 -147 b 619 363 966 200 831 363 b 577 389 582 363 582 363 z m 677 1358 b 763 1240 724 1358 763 1319 b 513 851 763 1080 626 950 b 494 863 503 842 497 844 b 485 995 488 900 485 949 b 677 1358 485 1220 589 1358 z m 520 377 b 498 343 524 350 524 351 b 289 63 372 300 289 186 b 455 -192 289 -66 357 -158 b 494 -200 467 -196 484 -200 b 511 -184 505 -200 511 -193 b 490 -166 511 -174 500 -170 b 386 -12 429 -140 386 -78 b 530 157 386 71 442 132 b 559 145 553 163 556 161 l 631 -284 b 611 -304 634 -300 632 -300 b 530 -311 588 -308 559 -311 b 115 29 278 -311 115 -171 b 249 363 115 114 130 228 b 469 567 336 459 402 513 b 490 562 484 579 487 577 z m 619 148 b 635 168 616 166 618 170 b 848 -66 752 158 848 60 b 713 -271 848 -157 793 -230 b 690 -262 696 -279 693 -279 z';
+
+const FCLEF_O = 'm 363 377 b 0 56 112 377 0 194 b 177 -158 0 -59 60 -158 b 330 -6 268 -158 330 -95 b 192 144 330 86 262 144 b 120 134 153 144 138 134 b 96 160 101 134 96 145 b 330 323 96 217 183 323 b 549 -53 482 323 549 173 b 14 -871 549 -455 350 -680 b -7 -897 1 -878 -7 -886 b 12 -914 -7 -906 -1 -914 b 36 -907 19 -914 27 -912 b 765 -40 390 -734 765 -478 b 363 377 765 210 612 377 z m 906 259 b 827 180 861 259 827 225 b 906 101 827 135 861 101 b 985 180 950 101 985 135 b 906 259 985 225 950 259 z m 907 -102 b 829 -180 863 -102 829 -135 b 907 -258 829 -225 863 -258 b 985 -180 952 -258 985 -225 b 907 -102 985 -135 952 -102 z';
+
+function renderOutline(outline, scale, xPos, yPos) {
+  const parts = outline.split(/\s+/);
+  ctx.beginPath();
+  let i = 0;
+  while (i < parts.length) {
+    switch (parts[i++]) {
+      case 'm':
+        ctx.moveTo(+parts[i++] * scale + xPos, yPos - parts[i++] * scale);
+        break;
+      case 'b': {
+        // VexFlow format: b endX endY cp1X cp1Y cp2X cp2Y
+        const ex = +parts[i++] * scale + xPos, ey = yPos - parts[i++] * scale;
+        ctx.bezierCurveTo(
+          +parts[i++] * scale + xPos, yPos - parts[i++] * scale,
+          +parts[i++] * scale + xPos, yPos - parts[i++] * scale,
+          ex, ey
+        );
+        break;
+      }
+      case 'l':
+        ctx.lineTo(+parts[i++] * scale + xPos, yPos - parts[i++] * scale);
+        break;
+      case 'z':
+        ctx.closePath();
+        break;
+    }
+  }
+  ctx.fill();
+}
+
+// ═══════════════════════════════════════════════════════════
+// KEY SIGNATURE ON STAFF
+// ═══════════════════════════════════════════════════════════
+
+function drawKeySigOnStaff(clef) {
+  if (keySig === 0) return;
+  const isTreble = clef === 'treble';
+  const positions = keySig > 0
+    ? (isTreble ? T_SHARP : B_SHARP)
+    : (isTreble ? T_FLAT : B_FLAT);
+  const count = Math.abs(keySig);
+  const sz = LINE_SP * 1;
+
+  for (let i = 0; i < count; i++) {
+    const x = STAFF_LEFT + CLEF_W + i * LINE_SP;
+    const y = staffPosToY(positions[i], clef);
+    if (keySig > 0) drawSharpSym(x, y, sz, '#1a1a1a');
+    else drawFlatSym(x, y, sz, '#1a1a1a');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// TOUCH TRACKING
+// ═══════════════════════════════════════════════════════════
+
+const activeTouches = new Map(); // id -> {staffPos, alteration, x, y, startY, sound, side, clef}
+
+function getXY(touch) {
+  const r = canvas.getBoundingClientRect();
+  return [touch.clientX - r.left, touch.clientY - r.top];
+}
+
+function onStart(id, x, y) {
+  if (activeTouches.size >= 4) return;
+  ensureAudio();
+  const { sp: rawSp, clef } = yToStaffInfo(y);
+  const sp = clef === 'treble'
+    ? Math.max(-4, Math.min(rawSp, 17))
+    : Math.max(-12, Math.min(rawSp, 4));
+  const midi = staffPosToMidi(sp, 0);
+  const sound = new NoteSound(midiToFreq(midi));
+  const side = x > W / 2 ? 'left' : 'right';
+  activeTouches.set(id, { staffPos: sp, alteration: 0, x, y, startY: y, sound, side, midi, clef });
+  draw();
+}
+
+function onMove(id, x, y) {
+  const t = activeTouches.get(id);
+  if (!t) return;
+  const dy = t.startY - y; // positive = dragged up
+  const threshold = LINE_SP * 1.5;
+  let newAlt = 0;
+  if (dy > threshold) newAlt = 1;
+  else if (dy < -threshold) newAlt = -1;
+  if (newAlt !== t.alteration) {
+    t.alteration = newAlt;
+    const midi = staffPosToMidi(t.staffPos, newAlt);
+    t.midi = midi;
+    t.sound.setFreq(midiToFreq(midi));
+    draw();
+  }
+}
+
+function onEnd(id) {
+  const t = activeTouches.get(id);
+  if (t) { t.sound.release(); activeTouches.delete(id); draw(); }
+}
+
+// Touch events
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) { const [x,y] = getXY(t); onStart(t.identifier, x, y); }
+}, {passive:false});
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) { const [x,y] = getXY(t); onMove(t.identifier, x, y); }
+}, {passive:false});
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) onEnd(t.identifier);
+}, {passive:false});
+canvas.addEventListener('touchcancel', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) onEnd(t.identifier);
+}, {passive:false});
+
+// Mouse fallback
+let mouseIsDown = false;
+canvas.addEventListener('mousedown', e => {
+  mouseIsDown = true; onStart('mouse', e.offsetX, e.offsetY);
+});
+canvas.addEventListener('mousemove', e => {
+  if (mouseIsDown) onMove('mouse', e.offsetX, e.offsetY);
+});
+canvas.addEventListener('mouseup', () => { mouseIsDown = false; onEnd('mouse'); });
+canvas.addEventListener('mouseleave', () => { if (mouseIsDown) { mouseIsDown = false; onEnd('mouse'); } });
+
+// ═══════════════════════════════════════════════════════════
+// MAIN DRAW
+// ═══════════════════════════════════════════════════════════
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.lineCap = 'round';
+
+  // ── Staff lines ──
+  // Treble: lines at sp = 2, 4, 6, 8, 10 (E4 G4 B4 D5 F5)
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 1.2;
+  for (let i = 0; i < 5; i++) {
+    const y = TREBLE_TOP + i * LINE_SP;
+    ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+  }
+
+  // Bass: lines at sp = -2, -4, -6, -8, -10 (A3 F3 D3 B2 G2)
+  for (let i = 0; i < 5; i++) {
+    const y = BASS_TOP + i * LINE_SP;
+    ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+  }
+
+  // ── Persistent grey ledger lines (SATB gap) ──
+  // 2 below treble: C4 (sp=0), A3 (sp=-2)
+  // 2 above bass: C4 (sp=0), E4 (sp=2)
+  ctx.strokeStyle = '#bbb';
+  ctx.lineWidth = 0.9;
+  const greyLW = LINE_SP * 2.5;
+  const gcx = W / 2;
+  for (const sp of [0, -2]) {
+    const y = staffPosToY(sp, 'treble');
+    ctx.beginPath(); ctx.moveTo(gcx - greyLW, y); ctx.lineTo(gcx + greyLW, y); ctx.stroke();
+  }
+  for (const sp of [2, 0]) {
+    const y = staffPosToY(sp, 'bass');
+    ctx.beginPath(); ctx.moveTo(gcx - greyLW, y); ctx.lineTo(gcx + greyLW, y); ctx.stroke();
+  }
+
+  // ── Clefs ──
+  ctx.fillStyle = '#1a1a1a';
+  const clefScale = LINE_SP / 250 * 0.7;
+  renderOutline(GCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, TREBLE_TOP + 3 * LINE_SP);
+  renderOutline(FCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, BASS_TOP + LINE_SP);
+
+  // ── Key signature ──
+  drawKeySigOnStaff('treble');
+  drawKeySigOnStaff('bass');
+
+  // ── Active notes ──
+  for (const [, t] of activeTouches) drawNote(t);
+}
+
+function drawNote(t) {
+  const sp = t.staffPos;
+  const clef = t.clef;
+  const noteY = staffPosToY(sp, clef);
+  const offsetDist = LINE_SP * 3.5;
+  const noteX = t.side === 'left' ? t.x - offsetDist : t.x + offsetDist;
+
+  const accent = '#d4621a';
+
+  // ── Ledger lines for this note ──
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 1.1;
+  const lw = LINE_SP * 1.2;
+
+  if (clef === 'treble') {
+    // Above treble staff (sp > 10)
+    if (sp > 10) {
+      for (let s = 12; s <= sp; s += 2) {
+        const ly = staffPosToY(s, 'treble');
+        ctx.beginPath(); ctx.moveTo(noteX - lw, ly); ctx.lineTo(noteX + lw, ly); ctx.stroke();
+      }
+    }
+    // Below treble staff (sp < 2, ledger lines at even positions)
+    if (sp < 2) {
+      for (let s = 0; s >= sp; s -= 2) {
+        const ly = staffPosToY(s, 'treble');
+        ctx.beginPath(); ctx.moveTo(noteX - lw, ly); ctx.lineTo(noteX + lw, ly); ctx.stroke();
+      }
+    }
+  } else {
+    // Above bass staff (sp > -2, ledger lines at even positions)
+    if (sp > -2) {
+      for (let s = 0; s <= sp; s += 2) {
+        const ly = staffPosToY(s, 'bass');
+        ctx.beginPath(); ctx.moveTo(noteX - lw, ly); ctx.lineTo(noteX + lw, ly); ctx.stroke();
+      }
+    }
+    // Below bass staff (sp < -10)
+    if (sp < -10) {
+      for (let s = -12; s >= sp; s -= 2) {
+        const ly = staffPosToY(s, 'bass');
+        ctx.beginPath(); ctx.moveTo(noteX - lw, ly); ctx.lineTo(noteX + lw, ly); ctx.stroke();
+      }
+    }
+  }
+
+  // ── Notehead (tilted filled ellipse) ──
+  ctx.save();
+  ctx.translate(noteX, noteY);
+  ctx.rotate(-0.32);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, LINE_SP * 0.68, LINE_SP * 0.45, 0, 0, Math.PI * 2);
+  ctx.fillStyle = accent;
+  ctx.fill();
+  ctx.restore();
+
+  // ── Stem ──
+  const stemUp = clef === 'treble' ? sp < 6 : sp < -6;
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  if (stemUp) {
+    ctx.moveTo(noteX + LINE_SP * 0.62, noteY - LINE_SP * 0.1);
+    ctx.lineTo(noteX + LINE_SP * 0.62, noteY - LINE_SP * 3.2);
+  } else {
+    ctx.moveTo(noteX - LINE_SP * 0.62, noteY + LINE_SP * 0.1);
+    ctx.lineTo(noteX - LINE_SP * 0.62, noteY + LINE_SP * 3.2);
+  }
+  ctx.stroke();
+
+  // ── Accidental (sharp/flat/natural) ──
+  if (t.alteration !== 0) {
+    const accX = noteX - LINE_SP * 1.4;
+    const accSz = LINE_SP * 0.9;
+    // Determine what symbol to show:
+    // The alteration shifts from key-sig-adjusted pitch.
+    // If keySig already has a sharp on this degree, +1 means double sharp (show ♯ or 𝄪),
+    // -1 means natural. If keySig has flat, +1 means natural, -1 means double flat.
+    // Simple approach: +1 alteration → ♯, -1 → ♭
+    // But if key sig already sharps this note and user flattens, it's actually a natural.
+    // Let's be smart:
+    const deg = ((sp % 7) + 7) % 7;
+    const altered = getAlteredDegrees(keySig);
+    const ksAdj = altered.has(deg) ? altered.get(deg) : 0;
+    const totalAlt = ksAdj + t.alteration;
+
+    if (totalAlt === 0) {
+      drawNaturalSym(accX, noteY, accSz, accent);
+    } else if (totalAlt > 0) {
+      drawSharpSym(accX, noteY, accSz, accent);
+    } else {
+      drawFlatSym(accX, noteY, accSz, accent);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// KEY SIGNATURE BAR
+// ═══════════════════════════════════════════════════════════
+
+const keyBar = document.getElementById('keyBar');
+KEY_SIGS.forEach(ks => {
+  const btn = document.createElement('button');
+  btn.className = 'key-btn' + (ks.v === 0 ? ' active' : '');
+  btn.textContent = ks.l;
+  btn.addEventListener('click', () => {
+    keySig = ks.v;
+    document.querySelectorAll('.key-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    draw();
+  });
+  btn.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
+  keyBar.appendChild(btn);
+});
+
+// ═══════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════
+
+function init() {
+  resize();
+  draw();
+}
+
+window.addEventListener('resize', () => { resize(); draw(); });
+init();
+</script>
+</body>
+</html>
