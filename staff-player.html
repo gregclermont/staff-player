@@ -84,8 +84,26 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 
 let audioCtx = null;
 function ensureAudio() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
   if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+// Equal-loudness compensation (simplified ISO 226)
+// Attempt to make all notes sound equally loud perceptually.
+// Boosts low frequencies, attenuates highs, referenced to ~500 Hz.
+function loudnessGain(freq) {
+  // Attempt to approximate the inverse of the equal-loudness contour.
+  // Below ~500 Hz: boost progressively (low freqs need more amplitude).
+  // Above ~2 kHz: slight attenuation (ear is very sensitive there).
+  // Reference level at 500 Hz = 1.0
+  const ref = 500;
+  if (freq < ref) {
+    // +6 dB per octave below 500 Hz (doubling amplitude per octave down)
+    return Math.pow(ref / freq, 0.6);
+  } else {
+    // Gentle rolloff above reference
+    return Math.pow(ref / freq, 0.2);
+  }
 }
 
 class NoteSound {
@@ -96,9 +114,10 @@ class NoteSound {
     this.gain = audioCtx.createGain();
     this.osc.type = 'sine';
     this.osc.frequency.value = freq;
-    // iOS Safari needs explicit scheduling from a known value
+    // Longer attack for low frequencies (need more cycles to avoid clicks)
+    const attack = Math.max(0.015, 4 / freq); // at least 4 cycles
     this.gain.gain.setValueAtTime(0.001, now);
-    this.gain.gain.linearRampToValueAtTime(0.32, now + 0.03);
+    this.gain.gain.linearRampToValueAtTime(0.22 * loudnessGain(freq), now + attack);
     this.osc.connect(this.gain);
     this.gain.connect(audioCtx.destination);
     this.osc.start(now);
@@ -109,6 +128,8 @@ class NoteSound {
       const now = audioCtx.currentTime;
       this.osc.frequency.setValueAtTime(this.osc.frequency.value, now);
       this.osc.frequency.linearRampToValueAtTime(f, now + 0.02);
+      this.gain.gain.setValueAtTime(this.gain.gain.value, now);
+      this.gain.gain.linearRampToValueAtTime(0.22 * loudnessGain(f), now + 0.02);
     }
   }
   release() {
