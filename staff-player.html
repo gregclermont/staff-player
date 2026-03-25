@@ -21,6 +21,7 @@ border-bottom:1px solid #ccc;border-top:1px solid #ccc;background:#f5f5f5}
 }
 .key-btn:last-child{border-right:none}
 .key-btn.active{background:#d74002;color:#fff}
+.key-btn.in-range{background:#d74002;color:#fff}
 .key-btn:active{background:#e8e8e8}
 
 canvas{flex:1;width:100%;display:block}
@@ -193,16 +194,15 @@ function resize() {
   canvas.width = W * dpr; canvas.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  LINE_SP = Math.min(28, Math.max(20, H / 16));
+  LINE_SP = H / 12;
 
-  // Layout: treble(4) + gap(6 = 5 lines + borders) + bass(4) = 14 LINE_SPs
-  // Gap has: 2 grey ledger below treble, 1 invisible, 2 grey ledger above bass
-  const total = 14 * LINE_SP;
+  // Layout: treble(4) + gap(2 = middle C) + bass(4) = 10 LINE_SPs
+  const total = 10 * LINE_SP;
   const top = (H - total) / 2;
 
   TREBLE_TOP = top;
-  BASS_SHIFT = 4 * LINE_SP; // extra offset pushing bass down from its natural position
-  BASS_TOP = top + 10 * LINE_SP;
+  BASS_SHIFT = 0;
+  BASS_TOP = top + 6 * LINE_SP;
 
   STAFF_RIGHT = W;
   CLEF_W = LINE_SP * 4;
@@ -383,9 +383,11 @@ function draw() {
   // Treble: lines at sp = 2, 4, 6, 8, 10 (E4 G4 B4 D5 F5)
   staffLW = Math.max(1.2, LINE_SP * 0.08);
 
-  // ── Key signature (behind lines, grey) ──
-  drawKeySigOnStaff('treble');
-  drawKeySigOnStaff('bass');
+  // ── Clefs (behind lines, grey) ──
+  ctx.fillStyle = '#ddd';
+  const clefScale = LINE_SP / 250 * 0.7;
+  renderOutline(GCLEF_O, clefScale, STAFF_LEFT, TREBLE_TOP + 3 * LINE_SP);
+  renderOutline(FCLEF_O, clefScale, STAFF_LEFT, BASS_TOP + LINE_SP);
 
   // ── Staff lines ──
   ctx.strokeStyle = '#1a1a1a';
@@ -401,27 +403,13 @@ function draw() {
     ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
   }
 
-  // ── Persistent grey ledger lines (SATB gap) ──
-  // 2 below treble: C4 (sp=0), A3 (sp=-2)
-  // 2 above bass: C4 (sp=0), E4 (sp=2)
-  ctx.strokeStyle = '#bbb';
+  // ── Middle C grey ledger line ──
+  ctx.strokeStyle = '#ddd';
   ctx.lineWidth = staffLW;
-  const greyLW = LINE_SP * 2.5;
+  const greyLW = LINE_SP * 1.2;
   const gcx = W / 2;
-  for (const sp of [0, -2]) {
-    const y = staffPosToY(sp, 'treble');
-    ctx.beginPath(); ctx.moveTo(gcx - greyLW, y); ctx.lineTo(gcx + greyLW, y); ctx.stroke();
-  }
-  for (const sp of [2, 0]) {
-    const y = staffPosToY(sp, 'bass');
-    ctx.beginPath(); ctx.moveTo(gcx - greyLW, y); ctx.lineTo(gcx + greyLW, y); ctx.stroke();
-  }
-
-  // ── Clefs ──
-  ctx.fillStyle = '#1a1a1a';
-  const clefScale = LINE_SP / 250 * 0.7;
-  renderOutline(GCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, TREBLE_TOP + 3 * LINE_SP);
-  renderOutline(FCLEF_O, clefScale, STAFF_LEFT + LINE_SP * 0.3, BASS_TOP + LINE_SP);
+  const mcY = staffPosToY(0, 'treble');
+  ctx.beginPath(); ctx.moveTo(gcx - greyLW, mcY); ctx.lineTo(gcx + greyLW, mcY); ctx.stroke();
 
   // ── Active notes ──
   for (const [, t] of activeTouches) drawNote(t);
@@ -513,19 +501,37 @@ function drawNote(t) {
 // ═══════════════════════════════════════════════════════════
 
 const keyBar = document.getElementById('keyBar');
-KEY_SIGS.forEach(ks => {
+const keyBtns = [];
+KEY_SIGS.forEach((ks, idx) => {
   const btn = document.createElement('button');
   btn.className = 'key-btn' + (ks.v === 0 ? ' active' : '');
   btn.textContent = ks.v < 0 ? '♭' : ks.v > 0 ? '♯' : '♮';
   btn.addEventListener('click', () => {
     keySig = ks.v;
-    document.querySelectorAll('.key-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
+    updateKeyBar();
     draw();
   });
   btn.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
   keyBar.appendChild(btn);
+  keyBtns.push({btn, ks});
 });
+
+function updateKeyBar() {
+  // The natural (♮) button is at index 7 (middle of 15 buttons)
+  const natIdx = 7;
+  keyBtns.forEach(({btn, ks}, idx) => {
+    btn.classList.remove('active', 'in-range');
+    if (ks.v === keySig) {
+      btn.classList.add('active');
+    } else if (keySig > 0 && idx > natIdx && idx < natIdx + keySig) {
+      // Sharps: highlight buttons between ♮ and active
+      btn.classList.add('in-range');
+    } else if (keySig < 0 && idx < natIdx && idx > natIdx + keySig) {
+      // Flats: highlight buttons between active and ♮
+      btn.classList.add('in-range');
+    }
+  });
+}
 
 // ═══════════════════════════════════════════════════════════
 // INIT
