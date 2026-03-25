@@ -313,21 +313,30 @@ function onStart(id, x, y) {
   const sp = clef === 'treble'
     ? Math.max(-4, Math.min(rawSp, 17))
     : Math.max(-12, Math.min(rawSp, 4));
-  const midi = staffPosToMidi(sp, 0);
+  // Left quarter = flat zone, right quarter = sharp zone (immediate, no swipe)
+  const zone = x < W * 0.25 ? 'flat' : x > W * 0.75 ? 'sharp' : null;
+  const alt = zone === 'sharp' ? 1 : zone === 'flat' ? -1 : 0;
+  const midi = staffPosToMidi(sp, alt);
   const sound = new NoteSound(midiToFreq(midi));
   const side = x > W / 2 ? 'left' : 'right';
-  activeTouches.set(id, { staffPos: sp, alteration: 0, x, y, startY: y, sound, side, midi, clef });
+  activeTouches.set(id, { staffPos: sp, alteration: alt, x, y, startY: y, sound, side, midi, clef, zone });
   draw();
 }
 
 function onMove(id, x, y) {
   const t = activeTouches.get(id);
   if (!t) return;
-  const dy = t.startY - y; // positive = dragged up
-  const threshold = LINE_SP * 1;
+  if (t.zone) return; // no swipe alteration in flat/sharp zones
+  // Dragging into alteration zones overrides vertical swipe
   let newAlt = 0;
-  if (dy > threshold) newAlt = 1;
-  else if (dy < -threshold) newAlt = -1;
+  if (x > W * 0.75) newAlt = 1;
+  else if (x < W * 0.25) newAlt = -1;
+  else {
+    const dy = t.startY - y; // positive = dragged up
+    const threshold = LINE_SP * 1;
+    if (dy > threshold) newAlt = 1;
+    else if (dy < -threshold) newAlt = -1;
+  }
   if (newAlt !== t.alteration) {
     t.alteration = newAlt;
     const midi = staffPosToMidi(t.staffPos, newAlt);
@@ -378,6 +387,11 @@ canvas.addEventListener('mouseleave', () => { if (mouseIsDown) { mouseIsDown = f
 function draw() {
   ctx.clearRect(0, 0, W, H);
   ctx.lineCap = 'round';
+
+  // ── Alteration zone backgrounds ──
+  ctx.fillStyle = '#f5f5f5';
+  ctx.fillRect(0, 0, W * 0.25, H);          // flat zone (left)
+  ctx.fillRect(W * 0.75, 0, W * 0.25, H);   // sharp zone (right)
 
   // ── Staff lines ──
   // Treble: lines at sp = 2, 4, 6, 8, 10 (E4 G4 B4 D5 F5)
