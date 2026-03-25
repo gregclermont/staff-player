@@ -10,27 +10,66 @@
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden;touch-action:none;background:#fff;color:#1a1a1a;
 user-select:none;-webkit-user-select:none;font-family:-apple-system,system-ui,sans-serif}
-body{display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+body{padding:0}
 
-.key-bar{display:flex;align-items:stretch;margin:0;flex-shrink:0;
-border-bottom:1px solid #ccc;border-top:1px solid #ccc;background:#f5f5f5}
+.settings-btn{
+  position:fixed;top:env(safe-area-inset-top,0);left:0;z-index:101;
+  border-radius:50%;
+  background:transparent;color:#ddd;border:none;font-weight:600;
+  font-family:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;
+}
+.settings-overlay{
+  position:fixed;inset:0;z-index:200;background:rgba(255,255,255,0.97);
+  display:none;flex-direction:column;padding:20px;padding-top:calc(env(safe-area-inset-top,0) + 20px);
+  overflow-y:auto;
+}
+.settings-overlay.open{display:flex}
+.settings-section{margin-bottom:24px}
+.settings-label{font-size:13px;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px}
+.key-bar{display:flex;align-items:stretch;border:1px solid #ccc;border-radius:8px;overflow:hidden}
 .key-btn{
   flex:1;border:none;border-right:1px solid #ccc;background:transparent;color:#1a1a1a;
-  font-size:15px;padding:6px 0;text-align:center;cursor:pointer;transition:all 0.15s;
+  font-size:15px;padding:8px 0;text-align:center;cursor:pointer;transition:all 0.15s;
   font-family:inherit;line-height:1;
 }
 .key-btn:last-child{border-right:none}
 .key-btn.active{background:#d74002;color:#fff}
 .key-btn.in-range{background:#d74002;color:#fff}
 .key-btn:active{background:#e8e8e8}
+.mode-bar{display:flex;gap:8px}
+.mode-opt{
+  flex:1;border:1px solid #ccc;border-radius:8px;background:transparent;color:#1a1a1a;
+  font-size:14px;padding:10px 0;text-align:center;cursor:pointer;font-family:inherit;
+}
+.mode-opt.active{background:#d74002;color:#fff;border-color:#d74002}
+.mode-opt:active{background:#e8e8e8}
+.settings-close{
+  align-self:flex-end;border:none;background:transparent;font-size:28px;color:#999;
+  cursor:pointer;padding:0 4px;margin-bottom:12px;font-family:inherit;
+}
 
-canvas{flex:1;width:100%;display:block}
+canvas{width:100%;height:100%;display:block}
 </style>
 </head>
 <body>
 
-<div class="key-bar" id="keyBar"></div>
 <canvas id="c"></canvas>
+<button class="settings-btn" id="settingsBtn">♮</button>
+<div class="settings-overlay" id="settingsOverlay">
+  <button class="settings-close" id="settingsClose">✕</button>
+  <div class="settings-section">
+    <div class="settings-label">Key Signature</div>
+    <div class="key-bar" id="keyBar"></div>
+  </div>
+  <div class="settings-section">
+    <div class="settings-label">Staves</div>
+    <div class="mode-bar">
+      <button class="mode-opt active" data-mode="both">𝄞 + 𝄢</button>
+      <button class="mode-opt" data-mode="treble">𝄞 only</button>
+      <button class="mode-opt" data-mode="bass">𝄢 only</button>
+    </div>
+  </div>
+</div>
 <div id="startOverlay" style="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.55);
 display:flex;align-items:center;justify-content:center;cursor:pointer">
 <span style="color:#fff;font-size:22px;font-weight:600;font-family:inherit;
@@ -60,7 +99,8 @@ const KEY_SIGS = [
   {l:'5♯',v:5},{l:'6♯',v:6},{l:'7♯',v:7},
 ];
 
-let keySig = 0;
+let keySig = parseInt(localStorage.getItem('keySig')) || 0;
+let staffMode = localStorage.getItem('staffMode') || 'both';
 
 function getAlteredDegrees(ks) {
   const m = new Map();
@@ -159,6 +199,7 @@ let STAFF_LEFT = 0;
 let STAFF_RIGHT;
 let CLEF_W;
 let staffLW;
+const TOP_RESERVE = 0;
 
 // Key sig accidental positions on staff
 // Treble sharp pos (staffPos): F5=10, C5=7, G5=11, D5=8, A4=5, E5=9, B4=6
@@ -169,14 +210,24 @@ const B_SHARP = [-4, -7, -3, -6, -9, -5, -8];
 const B_FLAT  = [-8, -5, -9, -6, -10, -7, -11];
 
 function staffPosToY(sp, clef) {
+  if (clef === 'bass' || staffMode === 'bass') {
+    // Bass system: sp=-2 (A3) at BASS_TOP
+    return BASS_TOP - (sp - (-2)) * (LINE_SP / 2);
+  }
   // Treble system: sp=2 (E4) at TREBLE_TOP + 4*LINE_SP
   const trebleBottom = TREBLE_TOP + 4 * LINE_SP;
-  const y = trebleBottom - (sp - 2) * (LINE_SP / 2);
-  return clef === 'bass' ? y + BASS_SHIFT : y;
+  return trebleBottom - (sp - 2) * (LINE_SP / 2);
 }
 
 function yToStaffInfo(y) {
-  // Determine which clef system a Y coordinate belongs to
+  if (staffMode === 'treble') {
+    const sp = Math.round(2 + (TREBLE_TOP + 4 * LINE_SP - y) / (LINE_SP / 2));
+    return { sp, clef: 'treble' };
+  }
+  if (staffMode === 'bass') {
+    const sp = Math.round(-2 - (y - BASS_TOP) / (LINE_SP / 2));
+    return { sp, clef: 'bass' };
+  }
   const mid = (TREBLE_TOP + 4 * LINE_SP + BASS_TOP) / 2;
   if (y <= mid) {
     const sp = Math.round(2 + (TREBLE_TOP + 4 * LINE_SP - y) / (LINE_SP / 2));
@@ -194,17 +245,42 @@ function resize() {
   canvas.width = W * dpr; canvas.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  LINE_SP = H / 12;
+  const usableH = H - TOP_RESERVE;
+  // both: 10 LS staves + 2 margin = 12; single: 4 LS staff + 2 LS ledger + 2 margin = 8
+  const staffUnits = staffMode === 'both' ? 12 : 8;
+  LINE_SP = usableH / staffUnits;
 
-  // Layout: treble(4) + gap(2 = middle C) + bass(4) = 10 LINE_SPs
-  const total = 10 * LINE_SP;
-  const top = (H - total) / 2;
-
-  TREBLE_TOP = top;
-  BASS_SHIFT = 0;
-  BASS_TOP = top + 6 * LINE_SP;
+  if (staffMode === 'both') {
+    const total = 10 * LINE_SP;
+    const top = TOP_RESERVE + (usableH - total) / 2;
+    TREBLE_TOP = top;
+    BASS_SHIFT = 0;
+    BASS_TOP = top + 6 * LINE_SP;
+  } else if (staffMode === 'treble') {
+    // Center 6 LS (4 staff + 2 ledger below)
+    const total = 6 * LINE_SP;
+    const top = TOP_RESERVE + (usableH - total) / 2;
+    TREBLE_TOP = top;
+    BASS_SHIFT = 0;
+    BASS_TOP = 9999; // off-screen
+  } else {
+    // Center 6 LS (2 ledger above + 4 staff)
+    const total = 6 * LINE_SP;
+    const top = TOP_RESERVE + (usableH - total) / 2;
+    BASS_TOP = top + 2 * LINE_SP;
+    TREBLE_TOP = -9999; // off-screen
+    BASS_SHIFT = 0;
+  }
 
   STAFF_RIGHT = W;
+
+  staffLW = Math.max(1.2, LINE_SP * 0.08);
+
+  const btnSz = LINE_SP - staffLW / 2;
+  const sb = document.getElementById('settingsBtn');
+  sb.style.width = btnSz + 'px';
+  sb.style.height = btnSz + 'px';
+  sb.style.fontSize = (btnSz * 0.6) + 'px';
   CLEF_W = LINE_SP * 4;
 }
 
@@ -307,6 +383,7 @@ function getXY(touch) {
 }
 
 function onStart(id, x, y) {
+  if (settingsOverlay.classList.contains('open')) { closeSettings(); return; }
   if (activeTouches.size >= 4) return;
   ensureAudio();
   const { sp: rawSp, clef } = yToStaffInfo(y);
@@ -393,37 +470,46 @@ function draw() {
   ctx.fillRect(0, 0, W * 0.25, H);          // flat zone (left)
   ctx.fillRect(W * 0.75, 0, W * 0.25, H);   // sharp zone (right)
 
-  // ── Staff lines ──
-  // Treble: lines at sp = 2, 4, 6, 8, 10 (E4 G4 B4 D5 F5)
-  staffLW = Math.max(1.2, LINE_SP * 0.08);
+  // ── Grey ledger lines (behind clefs and staff lines) ──
+  ctx.strokeStyle = '#f5f5f5';
+  ctx.lineWidth = staffLW;
+  if (staffMode === 'both') {
+    const mcY = staffPosToY(0, 'treble');
+    ctx.beginPath(); ctx.moveTo(STAFF_LEFT, mcY); ctx.lineTo(STAFF_RIGHT, mcY); ctx.stroke();
+  } else if (staffMode === 'treble') {
+    for (const sp of [0, -2]) {
+      const y = staffPosToY(sp, 'treble');
+      ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+    }
+  } else {
+    for (const sp of [0, 2]) {
+      const y = staffPosToY(sp, 'bass');
+      ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+    }
+  }
 
   // ── Clefs (behind lines, grey) ──
   ctx.fillStyle = '#ddd';
   const clefScale = LINE_SP / 250 * 0.7;
-  renderOutline(GCLEF_O, clefScale, STAFF_LEFT, TREBLE_TOP + 3 * LINE_SP);
-  renderOutline(FCLEF_O, clefScale, STAFF_LEFT, BASS_TOP + LINE_SP);
+  if (staffMode !== 'bass') renderOutline(GCLEF_O, clefScale, STAFF_LEFT, TREBLE_TOP + 3 * LINE_SP);
+  if (staffMode !== 'treble') renderOutline(FCLEF_O, clefScale, STAFF_LEFT, BASS_TOP + LINE_SP);
 
   // ── Staff lines ──
   ctx.strokeStyle = '#1a1a1a';
   ctx.lineWidth = staffLW;
-  for (let i = 0; i < 5; i++) {
-    const y = TREBLE_TOP + i * LINE_SP;
-    ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+  if (staffMode !== 'bass') {
+    for (let i = 0; i < 5; i++) {
+      const y = TREBLE_TOP + i * LINE_SP;
+      ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+    }
+  }
+  if (staffMode !== 'treble') {
+    for (let i = 0; i < 5; i++) {
+      const y = BASS_TOP + i * LINE_SP;
+      ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
+    }
   }
 
-  // Bass: lines at sp = -2, -4, -6, -8, -10 (A3 F3 D3 B2 G2)
-  for (let i = 0; i < 5; i++) {
-    const y = BASS_TOP + i * LINE_SP;
-    ctx.beginPath(); ctx.moveTo(STAFF_LEFT, y); ctx.lineTo(STAFF_RIGHT, y); ctx.stroke();
-  }
-
-  // ── Middle C grey ledger line ──
-  ctx.strokeStyle = '#ddd';
-  ctx.lineWidth = staffLW;
-  const greyLW = LINE_SP * 1.2;
-  const gcx = W / 2;
-  const mcY = staffPosToY(0, 'treble');
-  ctx.beginPath(); ctx.moveTo(gcx - greyLW, mcY); ctx.lineTo(gcx + greyLW, mcY); ctx.stroke();
 
   // ── Active notes ──
   for (const [, t] of activeTouches) drawNote(t);
@@ -440,7 +526,7 @@ function drawNote(t) {
   // ── Ledger lines for this note ──
   ctx.strokeStyle = '#1a1a1a';
   ctx.lineWidth = staffLW;
-  const lw = LINE_SP * 1.2;
+  const lw = LINE_SP * 1;
 
   if (clef === 'treble') {
     // Above treble staff (sp > 10)
@@ -486,7 +572,7 @@ function drawNote(t) {
 
   // ── Accidental (sharp/flat/natural) ──
   if (t.alteration !== 0) {
-    const accX = noteX - LINE_SP * 1.4;
+    const accX = noteX - LINE_SP * 1.7;
     const accSz = LINE_SP * 0.9;
     // Determine what symbol to show:
     // The alteration shifts from key-sig-adjusted pitch.
@@ -515,14 +601,24 @@ function drawNote(t) {
 // ═══════════════════════════════════════════════════════════
 
 const keyBar = document.getElementById('keyBar');
+const settingsBtn = document.getElementById('settingsBtn');
+const settingsOverlay = document.getElementById('settingsOverlay');
+const settingsClose = document.getElementById('settingsClose');
 const keyBtns = [];
+
+function keySigLabel(v) {
+  if (v === 0) return '♮';
+  return Math.abs(v) + (v > 0 ? '♯' : '♭');
+}
+
 KEY_SIGS.forEach((ks, idx) => {
   const btn = document.createElement('button');
   btn.className = 'key-btn' + (ks.v === 0 ? ' active' : '');
   btn.textContent = ks.v < 0 ? '♭' : ks.v > 0 ? '♯' : '♮';
   btn.addEventListener('click', () => {
     keySig = ks.v;
-    updateKeyBar();
+    localStorage.setItem('keySig', keySig);
+    updateSettings();
     draw();
   });
   btn.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
@@ -530,28 +626,54 @@ KEY_SIGS.forEach((ks, idx) => {
   keyBtns.push({btn, ks});
 });
 
-function updateKeyBar() {
-  // The natural (♮) button is at index 7 (middle of 15 buttons)
+document.querySelectorAll('.mode-opt').forEach(opt => {
+  opt.addEventListener('click', () => {
+    staffMode = opt.dataset.mode;
+    localStorage.setItem('staffMode', staffMode);
+    document.querySelectorAll('.mode-opt').forEach(o => o.classList.remove('active'));
+    opt.classList.add('active');
+    resize(); draw();
+  });
+  opt.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
+});
+
+function updateSettings() {
+  settingsBtn.textContent = keySigLabel(keySig);
   const natIdx = 7;
   keyBtns.forEach(({btn, ks}, idx) => {
     btn.classList.remove('active', 'in-range');
     if (ks.v === keySig) {
       btn.classList.add('active');
     } else if (keySig > 0 && idx > natIdx && idx < natIdx + keySig) {
-      // Sharps: highlight buttons between ♮ and active
       btn.classList.add('in-range');
     } else if (keySig < 0 && idx < natIdx && idx > natIdx + keySig) {
-      // Flats: highlight buttons between active and ♮
       btn.classList.add('in-range');
     }
   });
 }
+
+function openSettings() {
+  settingsOverlay.classList.add('open');
+  settingsBtn.style.display = 'none';
+}
+function closeSettings() {
+  settingsOverlay.classList.remove('open');
+  settingsBtn.style.display = '';
+}
+
+settingsBtn.addEventListener('click', openSettings);
+settingsClose.addEventListener('click', closeSettings);
 
 // ═══════════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════════
 
 function init() {
+  // Sync UI with persisted settings
+  updateSettings();
+  document.querySelectorAll('.mode-opt').forEach(o => {
+    o.classList.toggle('active', o.dataset.mode === staffMode);
+  });
   resize();
   draw();
 }
