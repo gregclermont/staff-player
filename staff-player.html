@@ -148,6 +148,7 @@ function ensureAudio() {
     }
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
 }
 
 // Equal-loudness compensation (simplified ISO 226)
@@ -160,8 +161,8 @@ function loudnessGain(freq) {
   // Reference level at 500 Hz = 1.0
   const ref = 500;
   if (freq < ref) {
-    // +6 dB per octave below 500 Hz (doubling amplitude per octave down)
-    return Math.pow(ref / freq, 0.6);
+    // ~12 dB per octave below 500 Hz (very aggressive boost for lows)
+    return Math.pow(ref / freq, 1.1);
   } else {
     // Gentle rolloff above reference
     return Math.pow(ref / freq, 0.2);
@@ -189,25 +190,28 @@ class NoteSound {
     const { osc, gain } = makeOsc(freq);
     this.osc = osc;
     this.gain = gain;
-    const vol = 0.22 * loudnessGain(freq);
+    this.freq = freq;
+    const vol = 0.45 * loudnessGain(freq);
     const attack = Math.max(0.015, 4 / freq);
     gain.gain.setValueAtTime(0, now);
     gain.gain.setTargetAtTime(vol, now, attack / 3);
     osc.start(now);
     this.alive = true;
   }
-  _retire(osc, gain) {
+  _retire(osc, gain, freq) {
     const now = audioCtx.currentTime;
+    // Release needs enough cycles to avoid cutting mid-waveform on low notes
+    const release = Math.max(FADE, 4 / freq) / 3;
     gain.gain.cancelScheduledValues(now);
-    gain.gain.setTargetAtTime(0, now, FADE / 3);
-    osc.stop(now + FADE * 5);
+    gain.gain.setTargetAtTime(0, now, release);
+    osc.stop(now + release * 15);
     osc.onended = () => { try { gain.disconnect(); } catch(e) {} };
   }
   setFreq(f) {
     if (!this.alive) return;
-    const vol = 0.22 * loudnessGain(f);
+    const vol = 0.45 * loudnessGain(f);
     // Retire old oscillator
-    this._retire(this.osc, this.gain);
+    this._retire(this.osc, this.gain, this.freq);
     // Fade in new oscillator at the new frequency
     const now = audioCtx.currentTime;
     const { osc, gain } = makeOsc(f);
@@ -216,11 +220,12 @@ class NoteSound {
     osc.start(now);
     this.osc = osc;
     this.gain = gain;
+    this.freq = f;
   }
   release() {
     if (!this.alive) return;
     this.alive = false;
-    this._retire(this.osc, this.gain);
+    this._retire(this.osc, this.gain, this.freq);
   }
 }
 
@@ -722,34 +727,7 @@ function init() {
 const startOverlay = document.getElementById('startOverlay');
 function dismissOverlay() {
   ensureAudio();
-  // Prime the audio output pipeline with a real (but nearly inaudible) tone
-  // so the first user note doesn't pop from DAC/hardware initialization
-  if (audioCtx) {
-    const now = audioCtx.currentTime;
-    const osc = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    g.gain.setValueAtTime(0.001, now);
-    g.gain.setTargetAtTime(0, now + 0.05, 0.01);
-    osc.connect(g);
-    g.connect(audioCtx.destination);
-    osc.start(now);
-    osc.stop(now + 0.15);
-    osc.onended = () => g.disconnect();
-  }
-  startOverlay.style.pointerEvents = 'none';
-  startOverlay.style.opacity = '0';
-  startOverlay.style.transition = 'opacity 0.15s';
-  // Wait for AudioContext to be running before accepting input
-  if (audioCtx && audioCtx.state !== 'running') {
-    audioCtx.addEventListener('statechange', function ready() {
-      if (audioCtx.state === 'running') {
-        audioCtx.removeEventListener('statechange', ready);
-        startOverlay.remove();
-      }
-    });
-  } else {
-    startOverlay.remove();
-  }
+  startOverlay.remove();
 }
 startOverlay.addEventListener('touchstart', e => { e.preventDefault(); dismissOverlay(); }, {passive: false});
 startOverlay.addEventListener('mousedown', dismissOverlay);
