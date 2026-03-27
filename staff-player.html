@@ -124,21 +124,27 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 // ═══════════════════════════════════════════════════════════
 
 let audioCtx = null;
-let audioDest = null; // destination node (may be MediaStreamDestination on iOS)
 function ensureAudio() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
-    audioDest = audioCtx.destination;
-    // iOS Safari: route through <audio> element to use "playback" category,
-    // which ignores the hardware silent switch
+    // Keep a silent oscillator running on the main output to keep the
+    // audio hardware pipeline warm (avoids pop on first real note)
+    const warmup = audioCtx.createOscillator();
+    const muteGain = audioCtx.createGain();
+    muteGain.gain.value = 0;
+    warmup.connect(muteGain);
+    muteGain.connect(audioCtx.destination);
+    warmup.start();
+    // iOS Safari: also feed silence through an <audio> element to switch
+    // the audio session to "playback" category (ignores hardware silent switch)
     if (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
       try {
         const streamDest = audioCtx.createMediaStreamDestination();
+        muteGain.connect(streamDest);
         const audio = new Audio();
         audio.srcObject = streamDest.stream;
         audio.play();
-        audioDest = streamDest;
-      } catch (e) { /* fall back to default destination */ }
+      } catch (e) {}
     }
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -162,40 +168,59 @@ function loudnessGain(freq) {
   }
 }
 
+const FADE = 0.02; // crossfade duration for frequency changes
+
+function makeOsc(freq) {
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  return { osc, gain };
+}
+
 class NoteSound {
   constructor(freq) {
     ensureAudio();
-    const now = audioCtx.currentTime;
-    this.osc = audioCtx.createOscillator();
-    this.gain = audioCtx.createGain();
-    this.osc.type = 'sine';
-    this.osc.frequency.value = freq;
-    // Longer attack for low frequencies (need more cycles to avoid clicks)
-    const attack = Math.max(0.015, 4 / freq); // at least 4 cycles
-    this.gain.gain.setValueAtTime(0.001, now);
-    this.gain.gain.linearRampToValueAtTime(0.22 * loudnessGain(freq), now + attack);
-    this.osc.connect(this.gain);
-    this.gain.connect(audioDest);
-    this.osc.start(now);
+    // Schedule slightly ahead to ensure the audio graph is compiled
+    // before the ramp starts (avoids percussive first-note on some browsers)
+    const now = audioCtx.currentTime + 0.005;
+    const { osc, gain } = makeOsc(freq);
+    this.osc = osc;
+    this.gain = gain;
+    const vol = 0.22 * loudnessGain(freq);
+    const attack = Math.max(0.015, 4 / freq);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.setTargetAtTime(vol, now, attack / 3);
+    osc.start(now);
     this.alive = true;
   }
+  _retire(osc, gain) {
+    const now = audioCtx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setTargetAtTime(0, now, FADE / 3);
+    osc.stop(now + FADE * 5);
+    osc.onended = () => { try { gain.disconnect(); } catch(e) {} };
+  }
   setFreq(f) {
-    if (this.alive) {
-      const now = audioCtx.currentTime;
-      this.osc.frequency.setValueAtTime(this.osc.frequency.value, now);
-      this.osc.frequency.linearRampToValueAtTime(f, now + 0.02);
-      this.gain.gain.setValueAtTime(this.gain.gain.value, now);
-      this.gain.gain.linearRampToValueAtTime(0.22 * loudnessGain(f), now + 0.02);
-    }
+    if (!this.alive) return;
+    const vol = 0.22 * loudnessGain(f);
+    // Retire old oscillator
+    this._retire(this.osc, this.gain);
+    // Fade in new oscillator at the new frequency
+    const now = audioCtx.currentTime;
+    const { osc, gain } = makeOsc(f);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.setTargetAtTime(vol, now, FADE / 3);
+    osc.start(now);
+    this.osc = osc;
+    this.gain = gain;
   }
   release() {
     if (!this.alive) return;
     this.alive = false;
-    const now = audioCtx.currentTime;
-    this.gain.gain.cancelScheduledValues(now);
-    this.gain.gain.setValueAtTime(this.gain.gain.value, now);
-    this.gain.gain.linearRampToValueAtTime(0, now + 0.15);
-    this.osc.stop(now + 0.2);
+    this._retire(this.osc, this.gain);
   }
 }
 
@@ -697,15 +722,34 @@ function init() {
 const startOverlay = document.getElementById('startOverlay');
 function dismissOverlay() {
   ensureAudio();
-  // Play a silent buffer to fully unlock iOS audio output
+  // Prime the audio output pipeline with a real (but nearly inaudible) tone
+  // so the first user note doesn't pop from DAC/hardware initialization
   if (audioCtx) {
-    const buf = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioDest);
-    src.start();
+    const now = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.001, now);
+    g.gain.setTargetAtTime(0, now + 0.05, 0.01);
+    osc.connect(g);
+    g.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.15);
+    osc.onended = () => g.disconnect();
   }
-  startOverlay.remove();
+  startOverlay.style.pointerEvents = 'none';
+  startOverlay.style.opacity = '0';
+  startOverlay.style.transition = 'opacity 0.15s';
+  // Wait for AudioContext to be running before accepting input
+  if (audioCtx && audioCtx.state !== 'running') {
+    audioCtx.addEventListener('statechange', function ready() {
+      if (audioCtx.state === 'running') {
+        audioCtx.removeEventListener('statechange', ready);
+        startOverlay.remove();
+      }
+    });
+  } else {
+    startOverlay.remove();
+  }
 }
 startOverlay.addEventListener('touchstart', e => { e.preventDefault(); dismissOverlay(); }, {passive: false});
 startOverlay.addEventListener('mousedown', dismissOverlay);
