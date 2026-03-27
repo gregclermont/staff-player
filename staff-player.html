@@ -124,8 +124,23 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 // ═══════════════════════════════════════════════════════════
 
 let audioCtx = null;
+let audioDest = null; // destination node (may be MediaStreamDestination on iOS)
 function ensureAudio() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
+    audioDest = audioCtx.destination;
+    // iOS Safari: route through <audio> element to use "playback" category,
+    // which ignores the hardware silent switch
+    if (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+      try {
+        const streamDest = audioCtx.createMediaStreamDestination();
+        const audio = new Audio();
+        audio.srcObject = streamDest.stream;
+        audio.play();
+        audioDest = streamDest;
+      } catch (e) { /* fall back to default destination */ }
+    }
+  }
   if (audioCtx.state === 'suspended') audioCtx.resume();
 }
 
@@ -160,7 +175,7 @@ class NoteSound {
     this.gain.gain.setValueAtTime(0.001, now);
     this.gain.gain.linearRampToValueAtTime(0.22 * loudnessGain(freq), now + attack);
     this.osc.connect(this.gain);
-    this.gain.connect(audioCtx.destination);
+    this.gain.connect(audioDest);
     this.osc.start(now);
     this.alive = true;
   }
@@ -687,7 +702,7 @@ function dismissOverlay() {
     const buf = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(audioCtx.destination);
+    src.connect(audioDest);
     src.start();
   }
   startOverlay.remove();
