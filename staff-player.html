@@ -18,36 +18,26 @@ body{padding:0}
   background:transparent;color:#ddd;border:none;font-weight:600;
   font-family:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;
 }
-.settings-overlay{
-  position:fixed;inset:0;z-index:200;background:rgba(255,255,255,0.97);
-  display:none;flex-direction:column;padding:20px;padding-top:calc(env(safe-area-inset-top,0) + 20px);
-  overflow-y:auto;
-}
-.settings-overlay.open{display:flex}
-.settings-section{margin-bottom:24px}
-.settings-label{font-size:13px;color:#999;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px}
-.key-bar{display:flex;align-items:stretch;border:1px solid #ccc;border-radius:8px;overflow:hidden}
-.key-btn{
-  flex:1;border:none;border-right:1px solid #ccc;background:transparent;color:#1a1a1a;
-  font-size:15px;padding:8px 0;text-align:center;cursor:pointer;transition:all 0.15s;
-  font-family:inherit;line-height:1;
-}
-.key-btn:last-child{border-right:none}
-.key-btn.active{background:#d74002;color:#fff}
-.key-btn.in-range{background:#d74002;color:#fff}
-.key-btn:active{background:#e8e8e8}
-.mode-bar{display:flex;gap:8px}
 .mode-opt{
   flex:1;border:1px solid #ccc;border-radius:8px;background:transparent;color:#1a1a1a;
   font-size:14px;padding:10px 0;text-align:center;cursor:pointer;font-family:inherit;
 }
 .mode-opt.active{background:#d74002;color:#fff;border-color:#d74002}
 .mode-opt:active{background:#e8e8e8}
-.settings-close{
-  align-self:flex-end;border:none;background:transparent;font-size:28px;color:#999;
-  cursor:pointer;padding:0 4px;margin-bottom:12px;font-family:inherit;
-}
 
+.picker{position:fixed;inset:0;z-index:150;background:rgba(255,255,255,0.94);display:none}
+.picker.open{display:block}
+.picker svg{position:absolute;left:0;top:0}
+.picker-bar{position:absolute;left:0;right:0;bottom:0;padding:8px 12px calc(env(safe-area-inset-bottom,0px) + 8px);
+  display:flex;flex-direction:column;gap:8px}
+.pb-row{display:flex;gap:8px}
+.pk-shape{fill:#fff;stroke:#ccc;stroke-width:1}
+.pk-item text{fill:#1a1a1a;text-anchor:middle;dominant-baseline:central;pointer-events:none;
+  font-family:-apple-system,system-ui,sans-serif}
+.pk-item text.sub{fill:#999}
+.pk-item.current .pk-shape{stroke:#d74002;stroke-width:2.5}
+.pk-item.hover .pk-shape{fill:#d74002;stroke:#d74002}
+.pk-item.hover text,.pk-item.hover text.sub{fill:#fff}
 canvas{width:100%;height:100%;display:block}
 </style>
 </head>
@@ -55,16 +45,11 @@ canvas{width:100%;height:100%;display:block}
 
 <canvas id="c"></canvas>
 <button class="settings-btn" id="settingsBtn">♮</button>
-<div class="settings-overlay" id="settingsOverlay">
-  <button class="settings-close" id="settingsClose">✕</button>
-  <div class="settings-section">
-    <div class="settings-label">Key Signature</div>
-    <div class="key-bar" id="keyBar"></div>
-  </div>
-  <div class="settings-section">
-    <div class="settings-label">Staves</div>
-    <div class="mode-bar">
-      <button class="mode-opt active" data-mode="both">𝄞 + 𝄢</button>
+<div class="picker" id="picker">
+  <svg id="pickerSvg"></svg>
+  <div class="picker-bar" id="pickerBar">
+    <div class="pb-row">
+      <button class="mode-opt" data-mode="both">𝄞 + 𝄢</button>
       <button class="mode-opt" data-mode="treble">𝄞 only</button>
       <button class="mode-opt" data-mode="bass">𝄢 only</button>
     </div>
@@ -92,15 +77,9 @@ const FLAT_ORDER  = [6, 2, 5, 1, 4, 0, 3]; // B E A D G C F
 
 const DIATONIC_SEMI = [0, 2, 4, 5, 7, 9, 11]; // C D E F G A B
 
-const KEY_SIGS = [
-  {l:'7♭',v:-7},{l:'6♭',v:-6},{l:'5♭',v:-5},{l:'4♭',v:-4},
-  {l:'3♭',v:-3},{l:'2♭',v:-2},{l:'1♭',v:-1},{l:'—',v:0},
-  {l:'1♯',v:1},{l:'2♯',v:2},{l:'3♯',v:3},{l:'4♯',v:4},
-  {l:'5♯',v:5},{l:'6♯',v:6},{l:'7♯',v:7},
-];
-
 let keySig = parseInt(localStorage.getItem('keySig')) || 0;
-let staffMode = localStorage.getItem('staffMode') || 'both';
+let staffMode = localStorage.getItem('staffMode');
+if (!['both', 'treble', 'bass'].includes(staffMode)) staffMode = 'both';
 
 function getAlteredDegrees(ks) {
   const m = new Map();
@@ -124,8 +103,14 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 // ═══════════════════════════════════════════════════════════
 
 let audioCtx = null;
+let sessionAudio = null; // <audio> element used for the iOS silent-switch fallback
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 function ensureAudio() {
   if (!audioCtx) {
+    // Safari 16.4+: a 'playback' audio session ignores the hardware silent switch
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
     // Keep a silent oscillator running on the main output to keep the
     // audio hardware pipeline warm (avoids pop on first real note)
@@ -135,21 +120,32 @@ function ensureAudio() {
     warmup.connect(muteGain);
     muteGain.connect(audioCtx.destination);
     warmup.start();
-    // iOS Safari: also feed silence through an <audio> element to switch
-    // the audio session to "playback" category (ignores hardware silent switch)
-    if (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) {
+    // Older iOS without navigator.audioSession: feed silence through an <audio>
+    // element to switch the audio session to "playback" instead
+    if (!navigator.audioSession && IS_IOS) {
       try {
         const streamDest = audioCtx.createMediaStreamDestination();
         muteGain.connect(streamDest);
-        const audio = new Audio();
-        audio.srcObject = streamDest.stream;
-        audio.play();
+        sessionAudio = new Audio();
+        sessionAudio.srcObject = streamDest.stream;
+        sessionAudio.play();
       } catch (e) {}
     }
   }
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (audioCtx.state !== 'running') audioCtx.resume(); // 'suspended' or iOS 'interrupted'
   return audioCtx;
 }
+
+// After the app is backgrounded (e.g. phone locked), iOS can hand the audio
+// back ducked until the app is relaunched. Tear the audio down instead and
+// rebuild it from the "Tap to start" overlay, exactly like a fresh launch.
+function shutdownAudio() {
+  for (const id of [...activeTouches.keys()]) onEnd(id);
+  if (sessionAudio) { sessionAudio.pause(); sessionAudio.srcObject = null; sessionAudio = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  startOverlay.style.display = 'flex';
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) shutdownAudio(); });
 
 // Equal-loudness compensation (simplified ISO 226)
 // Attempt to make all notes sound equally loud perceptually.
@@ -245,14 +241,6 @@ let STAFF_RIGHT;
 let CLEF_W;
 let staffLW;
 const TOP_RESERVE = 0;
-
-// Key sig accidental positions on staff
-// Treble sharp pos (staffPos): F5=10, C5=7, G5=11, D5=8, A4=5, E5=9, B4=6
-const T_SHARP = [10, 7, 11, 8, 5, 9, 6];
-const T_FLAT  = [6, 9, 5, 8, 4, 7, 3];
-// Bass: same visual positions as treble, mapped to bass staff positions
-const B_SHARP = [-4, -7, -3, -6, -9, -5, -8];
-const B_FLAT  = [-8, -5, -9, -6, -10, -7, -11];
 
 function staffPosToY(sp, clef) {
   if (clef === 'bass' || staffMode === 'bass') {
@@ -396,27 +384,6 @@ function renderOutline(outline, scale, xPos, yPos) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// KEY SIGNATURE ON STAFF
-// ═══════════════════════════════════════════════════════════
-
-function drawKeySigOnStaff(clef) {
-  if (keySig === 0) return;
-  const isTreble = clef === 'treble';
-  const positions = keySig > 0
-    ? (isTreble ? T_SHARP : B_SHARP)
-    : (isTreble ? T_FLAT : B_FLAT);
-  const count = Math.abs(keySig);
-  const sz = LINE_SP * 1;
-
-  for (let i = 0; i < count; i++) {
-    const x = STAFF_LEFT + CLEF_W + i * LINE_SP;
-    const y = staffPosToY(positions[i], clef);
-    if (keySig > 0) drawSharpSym(x, y, sz, '#ddd');
-    else drawFlatSym(x, y, sz, '#ddd');
-  }
-}
-
-// ═══════════════════════════════════════════════════════════
 // TOUCH TRACKING
 // ═══════════════════════════════════════════════════════════
 
@@ -428,7 +395,6 @@ function getXY(touch) {
 }
 
 function onStart(id, x, y) {
-  if (settingsOverlay.classList.contains('open')) { closeSettings(); return; }
   if (activeTouches.size >= 4) return;
   ensureAudio();
   const { sp: rawSp, clef } = yToStaffInfo(y);
@@ -556,6 +522,8 @@ function draw() {
   }
 
 
+  drawEdgeMarks();
+
   // ── Active notes ──
   for (const [, t] of activeTouches) drawNote(t);
 }
@@ -642,72 +610,206 @@ function drawNote(t) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// KEY SIGNATURE BAR
+// EDGE MARKS — key signature shown as small ♯/♭ at the left edge
 // ═══════════════════════════════════════════════════════════
 
-const keyBar = document.getElementById('keyBar');
+// Every altered line/space gets a mark, on the left so the (right) playing
+// thumb doesn't cover them. A halo in the background colour separates each
+// mark from the staff lines and clef underneath.
+const MARK_COLOR = '#999';
+const MARK_SIZE = 0.12; // in staff spaces (×LINE_SP); adjacent positions never touch
+
+function drawEdgeMarks() {
+  if (keySig === 0) return;
+  const alt = getAlteredDegrees(keySig);
+  const clefs = staffMode === 'both' ? ['treble', 'bass'] : [staffMode];
+  // Skip positions hidden under the corner key button
+  const btnBottom = settingsBtn.getBoundingClientRect().bottom - canvas.getBoundingClientRect().top;
+  for (const clef of clefs) {
+    const [lo, hi] = clef === 'treble' ? [-4, 17] : [-12, 4];
+    for (let sp = lo; sp <= hi; sp++) {
+      if (!alt.has(((sp % 7) + 7) % 7)) continue;
+      const y = staffPosToY(sp, clef);
+      if (y < btnBottom - LINE_SP * 0.1 || y > H || yToStaffInfo(y).clef !== clef) continue;
+      drawMark(y, keySig > 0);
+    }
+  }
+}
+
+function drawMark(y, sharp) {
+  const x = LINE_SP * 0.3;
+  const sz = LINE_SP * MARK_SIZE;
+  const scale = sharp ? sz / 350 : sz / 310;
+  ctx.save();
+  ctx.translate(x - (sharp ? 180 : 80) * scale, y);
+  tracePath(sharp ? ACC_SHARP_O : ACC_FLAT_O, scale);
+  ctx.restore();
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(3, LINE_SP * 0.07);
+  ctx.strokeStyle = '#f5f5f5'; // flat-zone background
+  ctx.stroke();
+  ctx.fillStyle = MARK_COLOR;
+  ctx.fill();
+}
+
+// Like renderOutline but only builds the path, at the current transform origin
+function tracePath(outline, scale) {
+  const p = outline.split(/\s+/);
+  ctx.beginPath();
+  let i = 0;
+  const X = () => +p[i++] * scale, Y = () => -p[i++] * scale;
+  while (i < p.length) {
+    switch (p[i++]) {
+      case 'm': ctx.moveTo(X(), Y()); break;
+      case 'l': ctx.lineTo(X(), Y()); break;
+      case 'b': { const ex = X(), ey = Y(); ctx.bezierCurveTo(X(), Y(), X(), Y(), ex, ey); break; }
+      case 'z': ctx.closePath(); break;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// KEY PICKER — press-drag-release, or tap to open
+// ═══════════════════════════════════════════════════════════
+
+const MAJOR = ['C♭','G♭','D♭','A♭','E♭','B♭','F','C','G','D','A','E','B','F♯','C♯'];
+
 const settingsBtn = document.getElementById('settingsBtn');
-const settingsOverlay = document.getElementById('settingsOverlay');
-const settingsClose = document.getElementById('settingsClose');
-const keyBtns = [];
+const picker = document.getElementById('picker');
+const pickerSvg = document.getElementById('pickerSvg');
+const pickerBar = document.getElementById('pickerBar');
+const SVGNS = 'http://www.w3.org/2000/svg';
 
 function keySigLabel(v) {
   if (v === 0) return '♮';
   return Math.abs(v) + (v > 0 ? '♯' : '♭');
 }
 
-KEY_SIGS.forEach((ks, idx) => {
-  const btn = document.createElement('button');
-  btn.className = 'key-btn' + (ks.v === 0 ? ' active' : '');
-  btn.textContent = ks.v < 0 ? '♭' : ks.v > 0 ? '♯' : '♮';
-  btn.addEventListener('click', () => {
-    keySig = ks.v;
-    localStorage.setItem('keySig', keySig);
-    updateSettings();
-    draw();
-  });
-  btn.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
-  keyBar.appendChild(btn);
-  keyBtns.push({btn, ks});
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+function svgText(parent, str, x, y, size, cls) {
+  const t = svgEl('text', { x, y, 'font-size': size, class: cls || '' }, parent);
+  t.textContent = str;
+  return t;
+}
+
+function addItem(v, d) {
+  const g = svgEl('g', { class: 'pk-item' + (v === keySig ? ' current' : ''), 'data-ks': v }, pickerSvg);
+  svgEl('path', { class: 'pk-shape', d }, g);
+  return g;
+}
+
+const polar = (r, a) => [r * Math.cos(a), r * Math.sin(a)];
+
+function wedgePath(rA, rB, a0, a1) {
+  const [x0, y0] = polar(rA, a0), [x1, y1] = polar(rB, a0);
+  const [x2, y2] = polar(rB, a1), [x3, y3] = polar(rA, a1);
+  return `M${x0} ${y0}L${x1} ${y1}A${rB} ${rB} 0 0 1 ${x2} ${y2}L${x3} ${y3}A${rA} ${rA} 0 0 0 ${x0} ${y0}Z`;
+}
+
+// Two rings fanning out from the top-left corner: ♮ in the corner, flats on
+// the inner ring, sharps on the outer ring, counts increasing clockwise.
+function buildPicker() {
+  pickerSvg.innerHTML = '';
+  pickerSvg.setAttribute('width', W);
+  pickerSvg.setAttribute('height', H);
+  const avail = H - pickerBar.offsetHeight;
+  const r0 = W * 0.2, r1 = W * 0.58, r2 = Math.min(W * 0.97, avail - 4);
+  const g0 = addItem(0, `M0 0L${r0} 0A${r0} ${r0} 0 0 1 0 ${r0}Z`);
+  svgText(g0, '♮', r0 * 0.38, r0 * 0.38, r0 * 0.35);
+  const step = (Math.PI / 2) / 7;
+  for (let i = 0; i < 7; i++) {
+    const a0 = i * step, a1 = (i + 1) * step, am = (a0 + a1) / 2;
+    const gf = addItem(-(i + 1), wedgePath(r0, r1, a0, a1));
+    const [fx, fy] = polar((r0 + r1) / 2, am);
+    svgText(gf, (i + 1) + '♭', fx, fy, 15);
+    const gs = addItem(i + 1, wedgePath(r1, r2, a0, a1));
+    const [sx, sy] = polar((r1 + r2) / 2, am);
+    svgText(gs, (i + 1) + '♯', sx, sy - 8, 16);
+    svgText(gs, MAJOR[i + 8], sx, sy + 10, 12, 'sub');
+  }
+  const cur = pickerSvg.querySelector('.pk-item.current');
+  if (cur) pickerSvg.appendChild(cur); // keep its outline on top of neighbours
+  document.querySelectorAll('.mode-opt').forEach(o => o.classList.toggle('active', o.dataset.mode === staffMode));
+}
+
+let pk = null;      // active pointer interaction: {id, x0, y0, moved}
+let hoverEl = null;
+
+function itemAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  return (el && el.closest && el.closest('[data-ks]')) || null;
+}
+
+function setHover(g) {
+  if (g === hoverEl) return;
+  if (hoverEl) hoverEl.classList.remove('hover');
+  hoverEl = g;
+  if (g) g.classList.add('hover');
+}
+
+function openPicker() {
+  picker.classList.add('open');
+  buildPicker();
+  setHover(null);
+}
+function closePicker() {
+  picker.classList.remove('open');
+  pk = null; hoverEl = null;
+}
+function selectKey(v) {
+  keySig = v;
+  localStorage.setItem('keySig', keySig);
+  updateSettings();
+  closePicker();
+  draw();
+}
+
+// Press on the corner button: picker opens immediately. Drag + release on a
+// key selects it. Releasing without moving leaves the picker open (tap mode).
+settingsBtn.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  openPicker();
+  pk = { id: e.pointerId, x0: e.clientX, y0: e.clientY, moved: false };
+});
+// In tap mode, a press anywhere in the picker starts a new (sliding) selection
+picker.addEventListener('pointerdown', e => {
+  if (pickerBar.contains(e.target)) return;
+  pk = { id: e.pointerId, x0: e.clientX, y0: e.clientY, moved: true };
+  setHover(itemAt(e.clientX, e.clientY));
+});
+window.addEventListener('pointermove', e => {
+  if (!pk || e.pointerId !== pk.id) return;
+  if (Math.hypot(e.clientX - pk.x0, e.clientY - pk.y0) > 10) pk.moved = true;
+  setHover(itemAt(e.clientX, e.clientY));
+});
+window.addEventListener('pointerup', e => {
+  if (!pk || e.pointerId !== pk.id) return;
+  if (!pk.moved) { pk = null; return; }  // tap: stay open
+  const g = itemAt(e.clientX, e.clientY);
+  if (g) selectKey(+g.dataset.ks);
+  else closePicker();                    // released on nothing: cancel
+});
+window.addEventListener('pointercancel', e => {
+  if (pk && e.pointerId === pk.id) closePicker();
 });
 
 document.querySelectorAll('.mode-opt').forEach(opt => {
   opt.addEventListener('click', () => {
     staffMode = opt.dataset.mode;
     localStorage.setItem('staffMode', staffMode);
-    document.querySelectorAll('.mode-opt').forEach(o => o.classList.remove('active'));
-    opt.classList.add('active');
-    resize(); draw();
+    resize(); draw(); buildPicker();
   });
-  opt.addEventListener('touchstart', e => e.stopPropagation(), {passive: true});
 });
 
 function updateSettings() {
   settingsBtn.textContent = keySigLabel(keySig);
-  const natIdx = 7;
-  keyBtns.forEach(({btn, ks}, idx) => {
-    btn.classList.remove('active', 'in-range');
-    if (ks.v === keySig) {
-      btn.classList.add('active');
-    } else if (keySig > 0 && idx > natIdx && idx < natIdx + keySig) {
-      btn.classList.add('in-range');
-    } else if (keySig < 0 && idx < natIdx && idx > natIdx + keySig) {
-      btn.classList.add('in-range');
-    }
-  });
 }
-
-function openSettings() {
-  settingsOverlay.classList.add('open');
-  settingsBtn.style.display = 'none';
-}
-function closeSettings() {
-  settingsOverlay.classList.remove('open');
-  settingsBtn.style.display = '';
-}
-
-settingsBtn.addEventListener('click', openSettings);
-settingsClose.addEventListener('click', closeSettings);
 
 // ═══════════════════════════════════════════════════════════
 // INIT
@@ -727,7 +829,7 @@ function init() {
 const startOverlay = document.getElementById('startOverlay');
 function dismissOverlay() {
   ensureAudio();
-  startOverlay.remove();
+  startOverlay.style.display = 'none';
 }
 startOverlay.addEventListener('touchstart', e => { e.preventDefault(); dismissOverlay(); }, {passive: false});
 startOverlay.addEventListener('mousedown', dismissOverlay);
