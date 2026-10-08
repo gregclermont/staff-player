@@ -31,6 +31,8 @@ body{padding:0}
 .picker-bar{position:absolute;left:0;right:0;bottom:0;padding:8px 12px calc(env(safe-area-inset-bottom,0px) + 8px);
   display:flex;flex-direction:column;gap:8px}
 .pb-row{display:flex;gap:8px}
+.voice-btn{flex:1;border:1px solid #ccc;border-radius:8px;background:transparent;color:#999;
+  font-size:14px;padding:10px 0;font-family:inherit}
 .pk-shape{fill:#fff;stroke:#ccc;stroke-width:1}
 .pk-item text{fill:#1a1a1a;text-anchor:middle;dominant-baseline:central;pointer-events:none;
   font-family:-apple-system,system-ui,sans-serif}
@@ -44,6 +46,9 @@ canvas{width:100%;height:100%;display:block}
 <body>
 
 <canvas id="c"></canvas>
+<pre id="diag" style="position:fixed;left:0;right:0;bottom:0;z-index:120;margin:0;padding:4px 6px;
+font:10px/1.25 ui-monospace,monospace;color:#333;background:rgba(255,255,220,0.85);pointer-events:none;
+max-height:34%;overflow:hidden;white-space:pre-wrap"></pre>
 <button class="settings-btn" id="settingsBtn">♮</button>
 <div class="picker" id="picker">
   <svg id="pickerSvg"></svg>
@@ -52,6 +57,10 @@ canvas{width:100%;height:100%;display:block}
       <button class="mode-opt" data-mode="both">𝄞 + 𝄢</button>
       <button class="mode-opt" data-mode="treble">𝄞 only</button>
       <button class="mode-opt" data-mode="bass">𝄢 only</button>
+    </div>
+    <div class="pb-row">
+      <button class="voice-btn" id="voiceBtn"></button>
+      <button class="voice-btn" id="sessionBtn"></button>
     </div>
   </div>
 </div>
@@ -103,14 +112,50 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 // ═══════════════════════════════════════════════════════════
 
 let audioCtx = null;
+let masterIn = null;     // all voices (except the legacy one) go through a limiter
 let sessionAudio = null; // <audio> element used for the iOS silent-switch fallback
+
+// DIAGNOSTICS (prototype): how the iOS audio session is put in 'playback' mode
+//   early: navigator.audioSession.type set at page load, before any audio
+//   late:  set right before creating the AudioContext (what shipped)
+//   hack:  old MediaStream <audio> trick only
+//   none:  neither (silent switch will mute)
+const SESSION_MODES = ['early', 'late', 'hack', 'none'];
+let sessionMode = localStorage.getItem('proto.session');
+if (!SESSION_MODES.includes(sessionMode)) sessionMode = 'early';
+
+const diagLines = [];
+const T0 = performance.now();
+function diag(msg) {
+  diagLines.push(((performance.now() - T0) / 1000).toFixed(2) + ' ' + msg);
+  if (diagLines.length > 14) diagLines.shift();
+  const el = document.getElementById('diag');
+  if (el) el.textContent = diagLines.join('\n');
+}
+window.addEventListener('error', e => diag('ERR ' + e.message));
+window.addEventListener('unhandledrejection', e => diag('REJ ' + (e.reason && e.reason.message || e.reason)));
+diag('mode=' + sessionMode + ' secure=' + window.isSecureContext + ' audioSession=' + (navigator.audioSession ? navigator.audioSession.type + '/' + navigator.audioSession.state : 'none'));
+if (navigator.audioSession) {
+  navigator.audioSession.onstatechange = () => diag('session state=' + navigator.audioSession.state + ' type=' + navigator.audioSession.type);
+  if (sessionMode === 'early') { navigator.audioSession.type = 'playback'; diag('session type=playback (early)'); }
+}
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// tanh curve: ~linear (×1.2) for normal levels, saturates smoothly to ±1
+function softClipCurve() {
+  const n = 1024, c = new Float32Array(n), k = 1.6;
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    c[i] = Math.tanh(k * x) / Math.tanh(k);
+  }
+  return c;
+}
 
 function ensureAudio() {
   if (!audioCtx) {
     // Safari 16.4+: a 'playback' audio session ignores the hardware silent switch
-    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+    if (sessionMode === 'late' && navigator.audioSession) { navigator.audioSession.type = 'playback'; diag('session type=playback (late)'); }
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'playback'});
     // Keep a silent oscillator running on the main output to keep the
     // audio hardware pipeline warm (avoids pop on first real note)
@@ -120,15 +165,35 @@ function ensureAudio() {
     warmup.connect(muteGain);
     muteGain.connect(audioCtx.destination);
     warmup.start();
+    // Limiter (with built-in makeup gain), then a soft clipper that rounds off
+    // the few transient peaks the limiter lets through, so chords never clip
+    const limiter = audioCtx.createDynamicsCompressor();
+    limiter.threshold.value = -6;
+    limiter.knee.value = 4;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.15;
+    masterIn = audioCtx.createGain();
+    masterIn.connect(limiter);
+    const pre = audioCtx.createGain();
+    pre.gain.value = 0.7;
+    const clipper = audioCtx.createWaveShaper();
+    clipper.curve = softClipCurve();
+    clipper.oversample = '2x';
+    limiter.connect(pre);
+    pre.connect(clipper);
+    clipper.connect(audioCtx.destination);
     // Older iOS without navigator.audioSession: feed silence through an <audio>
     // element to switch the audio session to "playback" instead
-    if (!navigator.audioSession && IS_IOS) {
+    audioCtx.onstatechange = () => diag('ctx ' + (audioCtx ? audioCtx.state : 'closed'));
+    diag('ctx created ' + audioCtx.state + ' sr=' + audioCtx.sampleRate);
+    if (sessionMode === 'hack' && IS_IOS) {
       try {
         const streamDest = audioCtx.createMediaStreamDestination();
         muteGain.connect(streamDest);
         sessionAudio = new Audio();
         sessionAudio.srcObject = streamDest.stream;
-        sessionAudio.play();
+        sessionAudio.play().then(() => diag('hack audio playing'), e => diag('hack audio failed ' + e));
       } catch (e) {}
     }
   }
@@ -140,6 +205,7 @@ function ensureAudio() {
 // back ducked until the app is relaunched. Tear the audio down instead and
 // rebuild it from the "Tap to start" overlay, exactly like a fresh launch.
 function shutdownAudio() {
+  diag('shutdown (hidden)');
   for (const id of [...activeTouches.keys()]) onEnd(id);
   if (sessionAudio) { sessionAudio.pause(); sessionAudio.srcObject = null; sessionAudio = null; }
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
@@ -147,81 +213,127 @@ function shutdownAudio() {
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) shutdownAudio(); });
 
-// Equal-loudness compensation (simplified ISO 226)
-// Attempt to make all notes sound equally loud perceptually.
-// Boosts low frequencies, attenuates highs, referenced to ~500 Hz.
-function loudnessGain(freq) {
-  // Attempt to approximate the inverse of the equal-loudness contour.
-  // Below ~500 Hz: boost progressively (low freqs need more amplitude).
-  // Above ~2 kHz: slight attenuation (ear is very sensitive there).
-  // Reference level at 500 Hz = 1.0
-  const ref = 500;
-  if (freq < ref) {
-    // ~12 dB per octave below 500 Hz (very aggressive boost for lows)
-    return Math.pow(ref / freq, 1.1);
-  } else {
-    // Gentle rolloff above reference
-    return Math.pow(ref / freq, 0.2);
+// ═══════════════════════════════════════════════════════════
+// VOICES (prototype) — switchable timbres for A/B testing on the phone
+// ═══════════════════════════════════════════════════════════
+
+// h: harmonic amplitudes (1st = fundamental). vibrato: depth in cents.
+// chorus: detune in cents for a second, slightly detuned oscillator.
+const VOICES = {
+  current:  { legacy: true },                       // the old clipped sine
+  sine:     { h: [1] },
+  flute:    { h: [1, 0.3, 0.1, 0.04], vibrato: 6 },
+  organ:    { h: [1, 0.7, 0.45, 0.3, 0, 0.2, 0, 0.12] },
+  clarinet: { h: [1, 0.03, 0.55, 0.03, 0.3, 0.02, 0.15, 0, 0.07] },
+  warm:     { h: Array.from({ length: 12 }, (_, i) => 1 / Math.pow(i + 1, 1.4)), chorus: 5 },
+};
+let voiceName = localStorage.getItem('proto.voice');
+if (!(voiceName in VOICES)) voiceName = 'organ';
+
+// The iPhone SE speaker barely reproduces anything below ~300 Hz. Harmonics
+// down there only eat headroom, so they're attenuated; the wave is then
+// peak-normalised, which makes the audible upper harmonics louder. The ear
+// still hears the fundamental pitch ("missing fundamental").
+const SPEAKER_LOW = 300;
+
+function makeWave(freq, h) {
+  const n = h.length + 1;
+  const real = new Float32Array(n), imag = new Float32Array(n);
+  for (let k = 1; k < n; k++) {
+    const hf = k * freq;
+    let w = h[k - 1];
+    if (hf < SPEAKER_LOW) w *= Math.pow(hf / SPEAKER_LOW, 1.5);
+    if (hf > 10000) w = 0;
+    imag[k] = w;
   }
+  return audioCtx.createPeriodicWave(real, imag);
+}
+
+let VOICE_LEVEL = 0.6;
+
+// Gentle loudness compensation (the waves above already do most of the work)
+function voiceGain(freq) {
+  const v = VOICES[voiceName];
+  if (v.legacy) return 0.45 * (freq < 500 ? Math.pow(500 / freq, 1.1) : Math.pow(500 / freq, 0.2));
+  const ref = 500;
+  return VOICE_LEVEL * (freq < ref ? Math.pow(ref / freq, 0.3) : Math.pow(ref / freq, 0.15));
 }
 
 const FADE = 0.02; // crossfade duration for frequency changes
 
-function makeOsc(freq) {
-  const osc = audioCtx.createOscillator();
+// One "layer" = the oscillator(s) for one pitch, behind a shared gain
+function makeLayer(freq, lfoGain) {
+  const v = VOICES[voiceName];
   const gain = audioCtx.createGain();
-  osc.type = 'sine';
-  osc.frequency.value = freq;
-  osc.connect(gain);
-  gain.connect(audioCtx.destination);
-  return { osc, gain };
+  gain.connect(v.legacy ? audioCtx.destination : masterIn);
+  const detunes = v.chorus ? [-v.chorus / 2, v.chorus / 2] : [0];
+  const oscs = detunes.map(cents => {
+    const osc = audioCtx.createOscillator();
+    if (v.legacy || v.h.length === 1) osc.type = 'sine';
+    else osc.setPeriodicWave(makeWave(freq, v.h));
+    osc.frequency.value = freq;
+    osc.detune.value = cents;
+    if (lfoGain) lfoGain.connect(osc.detune);
+    osc.connect(gain);
+    return osc;
+  });
+  // Chorus pair: scale down so the sum stays at about the same level
+  return { oscs, gain, scale: oscs.length > 1 ? 0.6 : 1 };
 }
 
 class NoteSound {
   constructor(freq) {
     ensureAudio();
+    const v = VOICES[voiceName];
     // Schedule slightly ahead to ensure the audio graph is compiled
     // before the ramp starts (avoids percussive first-note on some browsers)
     const now = audioCtx.currentTime + 0.005;
-    const { osc, gain } = makeOsc(freq);
-    this.osc = osc;
-    this.gain = gain;
+    if (v.vibrato) {
+      // Delayed vibrato: fades in after the note has settled
+      this.lfo = audioCtx.createOscillator();
+      this.lfo.frequency.value = 5.2;
+      this.lfoGain = audioCtx.createGain();
+      this.lfoGain.gain.setValueAtTime(0, now);
+      this.lfoGain.gain.setTargetAtTime(v.vibrato, now + 0.35, 0.25);
+      this.lfo.connect(this.lfoGain);
+      this.lfo.start(now);
+    }
+    this.layer = makeLayer(freq, this.lfoGain);
     this.freq = freq;
-    const vol = 0.45 * loudnessGain(freq);
+    const vol = voiceGain(freq) * this.layer.scale;
     const attack = Math.max(0.015, 4 / freq);
-    gain.gain.setValueAtTime(0, now);
-    gain.gain.setTargetAtTime(vol, now, attack / 3);
-    osc.start(now);
+    this.layer.gain.gain.setValueAtTime(0, now);
+    this.layer.gain.gain.setTargetAtTime(vol, now, attack / 3);
+    for (const o of this.layer.oscs) o.start(now);
     this.alive = true;
   }
-  _retire(osc, gain, freq) {
+  _retire(layer, freq) {
     const now = audioCtx.currentTime;
     // Release needs enough cycles to avoid cutting mid-waveform on low notes
     const release = Math.max(FADE, 4 / freq) / 3;
-    gain.gain.cancelScheduledValues(now);
-    gain.gain.setTargetAtTime(0, now, release);
-    osc.stop(now + release * 15);
-    osc.onended = () => { try { gain.disconnect(); } catch(e) {} };
+    layer.gain.gain.cancelScheduledValues(now);
+    layer.gain.gain.setTargetAtTime(0, now, release);
+    for (const o of layer.oscs) o.stop(now + release * 15);
+    layer.oscs[0].onended = () => { try { layer.gain.disconnect(); } catch(e) {} };
+    return now + release * 15;
   }
   setFreq(f) {
     if (!this.alive) return;
-    const vol = 0.45 * loudnessGain(f);
-    // Retire old oscillator
-    this._retire(this.osc, this.gain, this.freq);
-    // Fade in new oscillator at the new frequency
+    this._retire(this.layer, this.freq);
+    // Fade in a new layer at the new frequency
     const now = audioCtx.currentTime;
-    const { osc, gain } = makeOsc(f);
-    gain.gain.setValueAtTime(0, now);
-    gain.gain.setTargetAtTime(vol, now, FADE / 3);
-    osc.start(now);
-    this.osc = osc;
-    this.gain = gain;
+    const layer = makeLayer(f, this.lfoGain);
+    layer.gain.gain.setValueAtTime(0, now);
+    layer.gain.gain.setTargetAtTime(voiceGain(f) * layer.scale, now, FADE / 3);
+    for (const o of layer.oscs) o.start(now);
+    this.layer = layer;
     this.freq = f;
   }
   release() {
     if (!this.alive) return;
     this.alive = false;
-    this._retire(this.osc, this.gain, this.freq);
+    const end = this._retire(this.layer, this.freq);
+    if (this.lfo) this.lfo.stop(end);
   }
 }
 
@@ -406,6 +518,7 @@ function onStart(id, x, y) {
   const alt = zone === 'sharp' ? 1 : zone === 'flat' ? -1 : 0;
   const midi = staffPosToMidi(sp, alt);
   const sound = new NoteSound(midiToFreq(midi));
+  diag('note on ' + midi + ' ctx=' + audioCtx.state + ' t=' + audioCtx.currentTime.toFixed(2));
   const side = x > W / 2 ? 'left' : 'right';
   activeTouches.set(id, { staffPos: sp, alteration: alt, x, y, startY: y, sound, side, midi, clef, zone });
   draw();
@@ -805,6 +918,23 @@ document.querySelectorAll('.mode-opt').forEach(opt => {
     localStorage.setItem('staffMode', staffMode);
     resize(); draw(); buildPicker();
   });
+});
+
+const voiceBtn = document.getElementById('voiceBtn');
+voiceBtn.textContent = 'Voice: ' + voiceName;
+voiceBtn.addEventListener('click', () => {
+  const names = Object.keys(VOICES);
+  voiceName = names[(names.indexOf(voiceName) + 1) % names.length];
+  localStorage.setItem('proto.voice', voiceName);
+  voiceBtn.textContent = 'Voice: ' + voiceName;
+});
+
+const sessionBtn = document.getElementById('sessionBtn');
+sessionBtn.textContent = 'Session: ' + sessionMode;
+sessionBtn.addEventListener('click', () => {
+  sessionMode = SESSION_MODES[(SESSION_MODES.indexOf(sessionMode) + 1) % SESSION_MODES.length];
+  localStorage.setItem('proto.session', sessionMode);
+  location.reload(); // 'early' only takes effect at page load
 });
 
 function updateSettings() {
